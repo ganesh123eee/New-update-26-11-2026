@@ -65,6 +65,65 @@ function handleFirestoreError(error: unknown, operationType: OperationType, path
 
 export { where, query, limit, orderBy } from 'firebase/firestore';
 
+export type AuditEntityCategory =
+  | 'assessment_report'
+  | 'training_register'
+  | 'template'
+  | 'assignment'
+  | 'system';
+
+export function inferAuditEntityType(logOrParams: {
+  entityType?: string;
+  module?: string;
+  action?: string;
+  details?: any;
+}): AuditEntityCategory {
+  const explicit = logOrParams.entityType;
+  if (
+    explicit === 'assessment_report' ||
+    explicit === 'training_register' ||
+    explicit === 'template' ||
+    explicit === 'assignment' ||
+    explicit === 'system'
+  ) {
+    return explicit;
+  }
+
+  const mod = String(logOrParams.module || '').toLowerCase();
+  const act = String(logOrParams.action || '').toLowerCase();
+  const det = logOrParams.details || {};
+
+  if (det.registerId || mod.includes('training register') || act.includes('training register')) {
+    return 'training_register';
+  }
+
+  if (
+    !mod.includes('dashboard') &&
+    (det.submissionId ||
+      det.evaluationId ||
+      mod.includes('report') ||
+      mod.includes('review') ||
+      mod.includes('evaluation') ||
+      mod.includes('assessment') ||
+      act.includes('evaluation') ||
+      act.includes('assessment') ||
+      act.includes('submission') ||
+      (act.includes('report') && !mod.includes('audit')))
+  ) {
+    return 'assessment_report';
+  }
+
+  if (det.templateId || mod.includes('template') || act.includes('template')) {
+    return 'template';
+  }
+
+  if (det.assignmentId || mod.includes('assignment') || act.includes('assignment') || act.includes('assigned')) {
+    return 'assignment';
+  }
+
+  return 'system';
+}
+
 export const firestoreService = {
   resolveDocRef(path: string, id: string) {
     if (path === 'settings') {
@@ -204,20 +263,12 @@ export const firestoreService = {
         details?.assignmentId ||
         details?.id;
 
-      const inferredEntityType =
-        meta?.entityType ||
-        details?.entityType ||
-        (details?.submissionId
-          ? 'assessment_report'
-          : module.toLowerCase().includes('training register')
-            ? 'training_register'
-            : module.toLowerCase().includes('template')
-              ? 'template'
-              : module.toLowerCase().includes('assignment')
-                ? 'assignment'
-                : module.toLowerCase().includes('report')
-                  ? 'assessment_report'
-                  : 'system');
+      const inferredEntityType = inferAuditEntityType({
+        entityType: meta?.entityType || details?.entityType,
+        module,
+        action,
+        details
+      });
 
       const inferredEntityTitle =
         meta?.entityTitle ||

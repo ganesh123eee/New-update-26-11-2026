@@ -19,7 +19,10 @@ import {
   Layers,
   BarChart3,
   RefreshCw,
-  History
+  History,
+  BellRing,
+  ArrowRightCircle,
+  Users
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { cn, formatDate, formatDateTime, formatSignatureDate, formatId } from '../lib/utils';
@@ -27,10 +30,22 @@ import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import * as XLSX from 'xlsx';
 import { useAuth } from '../contexts/AuthContext';
-import { firestoreService, where } from '../services/firestoreService';
-import { Submission, Evaluation, Template, Assignment, User as UserType, Department, TrainingRegister, AuditLog } from '../types';
+import { firestoreService, where, inferAuditEntityType } from '../services/firestoreService';
+import { trainingRegisterService } from '../services/trainingRegisterService';
+import { Submission, Evaluation, Template, Assignment, User as UserType, Department, TrainingRegister, TrainingRegisterTemplateConfig, AuditLog } from '../types';
 import { BrandLogo } from '../components/BrandLogo';
 import { drawPdfBrandingHeader, sanitizeReportBrandName } from '../utils/pdfBranding';
+import { AuditLifecyclePanel, SingleActivityDetailCard } from '../components/AuditLifecyclePanel';
+import {
+  buildEvaluationReportLifecycle,
+  buildTrainingRegisterLifecycle,
+  EnrichedAuditLog,
+  enrichAuditLogEntry,
+  formatActorInline,
+  formatDetailEntries,
+  LifecycleReportSummary,
+  matchesSubmissionOrAssignmentLog
+} from '../utils/auditLifecycle';
 
 export default function Reports() {
   const { user: currentUser, branding } = useAuth();
@@ -42,6 +57,7 @@ export default function Reports() {
   const [previewData, setPreviewData] = useState<{ title: string; headers: string[]; rows: any[] } | null>(null);
   const [selectedIndividualReport, setSelectedIndividualReport] = useState<any>(null);
   const [individualAuditLogs, setIndividualAuditLogs] = useState<AuditLog[]>([]);
+  const [individualLifecycleSummary, setIndividualLifecycleSummary] = useState<LifecycleReportSummary | null>(null);
   
   // Tab navigation
   const [activeReportTab, setActiveReportTab] = useState<'summary' | 'custom' | 'audit'>('summary');
@@ -53,6 +69,15 @@ export default function Reports() {
   const [selectedAuditEntityId, setSelectedAuditEntityId] = useState<string>('all');
   const [auditSearchText, setAuditSearchText] = useState<string>('');
   const [reportEntityOptions, setReportEntityOptions] = useState<Array<{ id: string; label: string; type: string }>>([]);
+  const [auditSubmissions, setAuditSubmissions] = useState<Submission[]>([]);
+  const [auditAssignments, setAuditAssignments] = useState<Assignment[]>([]);
+  const [auditEvaluations, setAuditEvaluations] = useState<Evaluation[]>([]);
+  const [auditRegisters, setAuditRegisters] = useState<TrainingRegister[]>([]);
+  const [auditTemplates, setAuditTemplates] = useState<Template[]>([]);
+  const [auditUsers, setAuditUsers] = useState<UserType[]>([]);
+  const [auditDepartments, setAuditDepartments] = useState<Department[]>([]);
+  const [auditTemplateConfig, setAuditTemplateConfig] = useState<TrainingRegisterTemplateConfig | null>(null);
+  const [selectedReportAuditLog, setSelectedReportAuditLog] = useState<EnrichedAuditLog | null>(null);
 
   // User Summary Report State
   const [summaryUserId, setSummaryUserId] = useState<string>('all');
@@ -113,19 +138,30 @@ export default function Reports() {
   const loadReportAuditTrail = async () => {
     setAuditLoading(true);
     try {
-      const [allLogs, allSubs, allRegs, allTemps, allAssigns, allUsers] = await Promise.all([
+      const [allLogs, allSubs, allRegs, allTemps, allAssigns, allUsers, allEvals, allDepts, tmplCfg] = await Promise.all([
         firestoreService.getCollection<AuditLog>('auditLogs'),
         firestoreService.getCollection<Submission>('submissions'),
         firestoreService.getCollection<TrainingRegister>('training_registers'),
         firestoreService.getCollection<Template>('templates'),
         firestoreService.getCollection<Assignment>('assignments'),
-        firestoreService.getCollection<UserType>('users')
+        firestoreService.getCollection<UserType>('users'),
+        firestoreService.getCollection<Evaluation>('reviews'),
+        firestoreService.getCollection<Department>('departments'),
+        trainingRegisterService.getTemplateConfig().catch(() => null)
       ]);
 
       const sortedLogs = [...allLogs].sort(
         (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
       );
       setAuditLogs(sortedLogs);
+      setAuditSubmissions(allSubs);
+      setAuditAssignments(allAssigns);
+      setAuditEvaluations(allEvals);
+      setAuditRegisters(allRegs);
+      setAuditTemplates(allTemps);
+      setAuditUsers(allUsers);
+      setAuditDepartments(allDepts);
+      setAuditTemplateConfig(tmplCfg);
 
       const entityMap = new Map<string, { id: string; label: string; type: string }>();
 
@@ -150,10 +186,11 @@ export default function Reports() {
 
       for (const log of sortedLogs) {
         if (log.entityId && !entityMap.has(log.entityId)) {
+          const resolvedType = inferAuditEntityType(log);
           entityMap.set(log.entityId, {
             id: log.entityId,
-            type: log.entityType || 'system',
-            label: `${(log.entityType || 'Record').replace(/_/g, ' ')}: ${log.entityTitle || log.entityId}`
+            type: resolvedType,
+            label: `${resolvedType.replace(/_/g, ' ')}: ${log.entityTitle || log.entityId}`
           });
         }
       }
@@ -402,17 +439,30 @@ export default function Reports() {
       setSelectedIndividualReport(data);
 
       try {
-        const logs = await firestoreService.getCollection<AuditLog>('auditLogs');
+        const [logs, allUsers, tmplCfg] = await Promise.all([
+          firestoreService.getCollection<AuditLog>('auditLogs'),
+          users.length > 0 ? Promise.resolve(users) : firestoreService.getCollection<UserType>('users'),
+          trainingRegisterService.getTemplateConfig().catch(() => null)
+        ]);
         const related = logs
-          .filter(l =>
-            l.entityId === submissionId ||
-            l.details?.submissionId === submissionId ||
-            (data.assignment?.id && (l.entityId === data.assignment.id || l.details?.assignmentId === data.assignment.id))
-          )
+          .filter(l => matchesSubmissionOrAssignmentLog(l, submissionId, data.assignment?.id))
           .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
         setIndividualAuditLogs(related);
+        setIndividualLifecycleSummary(
+          buildEvaluationReportLifecycle({
+            submission: data.submission,
+            assignment: data.assignment,
+            evaluation: data.evaluation,
+            template: data.template,
+            users: allUsers,
+            departments,
+            logs: related,
+            templateConfig: tmplCfg
+          })
+        );
       } catch {
         setIndividualAuditLogs([]);
+        setIndividualLifecycleSummary(null);
       }
 
       await firestoreService.logActivity(
@@ -1642,22 +1692,89 @@ export default function Reports() {
             auditCategoryFilter === 'all' ? true : opt.type === auditCategoryFilter
           );
 
-          const filteredAuditLogs = auditLogs.filter(log => {
-            if (auditCategoryFilter !== 'all' && (log.entityType || 'system') !== auditCategoryFilter) {
+          const selectedSubmission = selectedAuditEntityId !== 'all'
+            ? auditSubmissions.find(s => s.id === selectedAuditEntityId)
+            : undefined;
+          const selectedRegister = selectedAuditEntityId !== 'all'
+            ? auditRegisters.find(r => r.id === selectedAuditEntityId)
+            : undefined;
+
+          const selectedAssignment = selectedAuditEntityId !== 'all'
+            ? auditAssignments.find(a => a.id === selectedAuditEntityId)
+            : undefined;
+
+          let selectedLifecycleSummary: LifecycleReportSummary | null = null;
+          if (selectedSubmission) {
+            const assign = auditAssignments.find(a => a.id === selectedSubmission.assignmentId);
+            const ev = auditEvaluations.find(e => e.submissionId === selectedSubmission.id);
+            const tmpl = auditTemplates.find(t => t.id === (selectedSubmission.templateId || assign?.templateId));
+            selectedLifecycleSummary = buildEvaluationReportLifecycle({
+              submission: selectedSubmission,
+              assignment: assign,
+              evaluation: ev,
+              template: tmpl,
+              users: auditUsers,
+              departments: auditDepartments,
+              logs: auditLogs,
+              templateConfig: auditTemplateConfig
+            });
+          } else if (selectedRegister) {
+            selectedLifecycleSummary = buildTrainingRegisterLifecycle({
+              register: selectedRegister,
+              users: auditUsers,
+              logs: auditLogs,
+              templateConfig: auditTemplateConfig
+            });
+          } else if (selectedAssignment) {
+            const sub = auditSubmissions.find(s => s.assignmentId === selectedAssignment.id) || null;
+            const ev = sub ? auditEvaluations.find(e => e.submissionId === sub.id) || null : null;
+            const tmpl = auditTemplates.find(t => t.id === selectedAssignment.templateId) || null;
+            selectedLifecycleSummary = buildEvaluationReportLifecycle({
+              submission: sub,
+              assignment: selectedAssignment,
+              evaluation: ev,
+              template: tmpl,
+              users: auditUsers,
+              departments: auditDepartments,
+              logs: auditLogs,
+              templateConfig: auditTemplateConfig
+            });
+          }
+
+          const enrichedLogs = auditLogs.map(l =>
+            enrichAuditLogEntry(l, auditUsers, {
+              submissions: auditSubmissions,
+              assignments: auditAssignments,
+              evaluations: auditEvaluations,
+              registers: auditRegisters,
+              templates: auditTemplates,
+              departments: auditDepartments,
+              templateConfig: auditTemplateConfig
+            })
+          );
+
+          const filteredAuditLogs = enrichedLogs.filter(log => {
+            const resolvedType = log.resolvedEntityType;
+            if (auditCategoryFilter !== 'all' && resolvedType !== auditCategoryFilter) {
               return false;
             }
             if (selectedAuditEntityId !== 'all') {
-              const matchesId =
-                log.entityId === selectedAuditEntityId ||
-                log.details?.submissionId === selectedAuditEntityId ||
-                log.details?.registerId === selectedAuditEntityId ||
-                log.details?.templateId === selectedAuditEntityId ||
-                log.details?.assignmentId === selectedAuditEntityId;
+              const matchesId = selectedSubmission
+                ? matchesSubmissionOrAssignmentLog(log, selectedSubmission.id, selectedSubmission.assignmentId)
+                : log.entityId === selectedAuditEntityId ||
+                  log.details?.submissionId === selectedAuditEntityId ||
+                  log.details?.registerId === selectedAuditEntityId ||
+                  log.details?.templateId === selectedAuditEntityId ||
+                  log.details?.assignmentId === selectedAuditEntityId ||
+                  (Array.isArray(log.details?.assignmentIds) && log.details.assignmentIds.includes(selectedAuditEntityId));
               if (!matchesId) return false;
             }
             if (auditSearchText.trim()) {
               const q = auditSearchText.toLowerCase();
-              const hay = `${log.action} ${log.module} ${log.entityTitle || ''} ${log.entityId || ''} ${log.userEmail || ''} ${JSON.stringify(log.details || {})} ${JSON.stringify(log.changes || [])}`.toLowerCase();
+              const involvedText = log.involvedParties
+                .map(p => `${p.roleInActivity} ${p.name} ${p.email || ''} ${p.employeeId || ''}`)
+                .join(' ');
+              const hay = `${log.stage} ${log.action} ${log.module} ${resolvedType} ${log.entityTitle || ''} ${log.entityId || ''} ${log.actor.name} ${log.actor.email} ${log.actor.employeeId || ''} ${log.actor.role || ''} ${involvedText} ${log.notifiedOnFinish.join(' ')} ${log.nextAfterFinish} ${JSON.stringify(log.details || {})} ${JSON.stringify(log.changes || [])}`.toLowerCase();
               if (!hay.includes(q)) return false;
             }
             return true;
@@ -1668,19 +1785,51 @@ export default function Reports() {
               toast.error('No audit trail entries to export.');
               return;
             }
-            const headers = ['Timestamp', 'Report / Entity Type', 'Report / Entity ID', 'Report Title', 'Action', 'User', 'Field Changes', 'Details'];
+            const headers = [
+              'Timestamp',
+              'Lifecycle Stage',
+              'Report / Entity Type',
+              'Report / Entity ID',
+              'Report Title',
+              'Action',
+              'Initiated By',
+              'Performed By Name',
+              'Performed By Employee ID',
+              'Performed By Email',
+              'Performed By Role',
+              'All Involved in Activity',
+              'Notified When Finished',
+              'After Finish Who Gets Next',
+              'Field Changes',
+              'All Details'
+            ];
             const csv = [
               headers.join(','),
-              ...filteredAuditLogs.map(l => [
-                `"${formatDateTime(l.timestamp)}"`,
-                `"${l.entityType || 'system'}"`,
-                `"${l.entityId || ''}"`,
-                `"${(l.entityTitle || '').replace(/"/g, '""')}"`,
-                `"${l.action}"`,
-                `"${l.userEmail || l.userId || 'System'}"`,
-                `"${JSON.stringify(l.changes || []).replace(/"/g, '""')}"`,
-                `"${JSON.stringify(l.details || {}).replace(/"/g, '""')}"`
-              ].join(','))
+              ...filteredAuditLogs.map(l => {
+                const involved = l.involvedParties
+                  .map(p => `${p.roleInActivity}: ${p.name}${p.employeeId ? ` [${p.employeeId}]` : ''}${p.email ? ` (${p.email})` : ''}`)
+                  .join(' | ')
+                  .replace(/"/g, '""');
+                const notified = l.notifiedOnFinish.join(' | ').replace(/"/g, '""');
+                return [
+                  `"${formatDateTime(l.timestamp)}"`,
+                  `"${l.stage}"`,
+                  `"${l.resolvedEntityType}"`,
+                  `"${l.entityId || ''}"`,
+                  `"${(l.entityTitle || '').replace(/"/g, '""')}"`,
+                  `"${l.action.replace(/"/g, '""')}"`,
+                  `"${(l.initiatedBy ? formatActorInline(l.initiatedBy) : formatActorInline(l.actor)).replace(/"/g, '""')}"`,
+                  `"${l.actor.name.replace(/"/g, '""')}"`,
+                  `"${(l.actor.employeeId || '').replace(/"/g, '""')}"`,
+                  `"${(l.actor.email || '').replace(/"/g, '""')}"`,
+                  `"${(l.actor.role || '').replace(/"/g, '""')}"`,
+                  `"${involved}"`,
+                  `"${notified}"`,
+                  `"${(l.nextAfterFinish || '').replace(/"/g, '""')}"`,
+                  `"${(l.changes || []).map(c => `${c.field}: ${c.from ?? '-'} -> ${c.to ?? '-'}`).join('; ').replace(/"/g, '""')}"`,
+                  `"${formatDetailEntries(l.details).map(d => `${d.label}: ${d.value}`).join(' | ').replace(/"/g, '""')}"`
+                ].join(',');
+              })
             ].join('\n');
             const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
             const link = document.createElement('a');
@@ -1702,7 +1851,7 @@ export default function Reports() {
                       <span>Report-Wise Audit Trail</span>
                     </h3>
                     <p className="text-xs text-muted-foreground mt-0.5">
-                      Inspect complete lifecycle history, field-level changes, signatures, views, and exports per Evaluation Report or Training Register.
+                      Inspect full end-to-end activity history showing who initiated, all involved people, who was notified on finish, and who gets it next.
                     </p>
                   </div>
                   <div className="flex items-center gap-2">
@@ -1746,7 +1895,7 @@ export default function Reports() {
                   </div>
 
                   <div className="space-y-1.5">
-                    <label className="text-xs font-bold uppercase text-muted-foreground">Select Specific Report</label>
+                    <label className="text-xs font-bold uppercase text-muted-foreground">Select Specific Report (Full Lifecycle)</label>
                     <select
                       value={selectedAuditEntityId}
                       onChange={(e) => setSelectedAuditEntityId(e.target.value)}
@@ -1762,14 +1911,14 @@ export default function Reports() {
                   </div>
 
                   <div className="space-y-1.5">
-                    <label className="text-xs font-bold uppercase text-muted-foreground">Search Activities / Users</label>
+                    <label className="text-xs font-bold uppercase text-muted-foreground">Search Activities / Involved / Notified / Next</label>
                     <div className="relative">
                       <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
                       <input
                         type="text"
                         value={auditSearchText}
                         onChange={(e) => setAuditSearchText(e.target.value)}
-                        placeholder="Search action, user, field..."
+                        placeholder="Search action, participant, notified, next owner..."
                         className="w-full pl-8 pr-3 py-2 bg-background border rounded-lg text-xs outline-none focus:ring-2 focus:ring-primary/20"
                       />
                     </div>
@@ -1777,10 +1926,21 @@ export default function Reports() {
                 </div>
               </div>
 
+              {selectedLifecycleSummary && (
+                <AuditLifecyclePanel
+                  summary={selectedLifecycleSummary}
+                  title={
+                    selectedLifecycleSummary.entityType === 'training_register'
+                      ? 'Training Register Full Lifecycle (Initiation to Closure)'
+                      : 'Evaluation Report Full Lifecycle (Initiation to Closure)'
+                  }
+                />
+              )}
+
               <div className="bg-card rounded-2xl border shadow-sm overflow-hidden">
                 <div className="p-4 border-b bg-muted/20 flex items-center justify-between">
                   <span className="text-sm font-bold">
-                    Audit Timeline ({filteredAuditLogs.length} entries)
+                    {selectedLifecycleSummary ? 'Raw Recorded Audit Log Entries' : 'Audit Timeline'} ({filteredAuditLogs.length} entries)
                   </span>
                 </div>
                 {auditLoading ? (
@@ -1797,52 +1957,177 @@ export default function Reports() {
                       <thead className="bg-muted/50 border-b text-muted-foreground uppercase font-bold">
                         <tr>
                           <th className="px-4 py-3">Timestamp</th>
-                          <th className="px-4 py-3">Report / Record</th>
-                          <th className="px-4 py-3">Action</th>
-                          <th className="px-4 py-3">Actor</th>
-                          <th className="px-4 py-3">Changes &amp; Details</th>
+                          <th className="px-4 py-3">Stage, Report &amp; Action</th>
+                          <th className="px-4 py-3">Initiator &amp; Actor</th>
+                          <th className="px-4 py-3">Involved, Notified &amp; Next Handoff</th>
+                          <th className="px-4 py-3">Changes &amp; Full Activity Details</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y">
-                        {filteredAuditLogs.map((log) => (
-                          <tr key={log.id} className="hover:bg-muted/20 transition-colors">
-                            <td className="px-4 py-3 whitespace-nowrap font-mono text-muted-foreground">
-                              {formatDateTime(log.timestamp)}
-                            </td>
-                            <td className="px-4 py-3">
-                              <div className="space-y-0.5">
-                                <span className="px-1.5 py-0.5 rounded bg-primary/10 text-primary text-[10px] font-bold uppercase">
-                                  {(log.entityType || 'system').replace(/_/g, ' ')}
-                                </span>
-                                {log.entityTitle && <p className="font-semibold text-foreground">{log.entityTitle}</p>}
-                                {log.entityId && <p className="text-[10px] font-mono text-muted-foreground">ID: {log.entityId}</p>}
-                              </div>
-                            </td>
-                            <td className="px-4 py-3 font-bold text-foreground">{log.action}</td>
-                            <td className="px-4 py-3 text-muted-foreground">{log.userEmail || log.userId || 'System'}</td>
-                            <td className="px-4 py-3 space-y-1 max-w-md">
-                              {Array.isArray(log.changes) && log.changes.length > 0 && (
-                                <div className="bg-muted/40 p-2 rounded border space-y-0.5">
-                                  {log.changes.map((c, cIdx) => (
-                                    <div key={cIdx} className="flex flex-wrap gap-1.5">
-                                      <span className="font-bold">{c.field}:</span>
-                                      <span className="text-rose-600 line-through">{String(c.from ?? '-')}</span>
-                                      <span>-&gt;</span>
-                                      <span className="text-emerald-700 font-semibold">{String(c.to ?? '-')}</span>
+                        {filteredAuditLogs.map((log) => {
+                          const detailPairs = formatDetailEntries(log.details);
+                          const targetEntityId =
+                            log.details?.submissionId ||
+                            log.details?.registerId ||
+                            log.entityId;
+                          const canInspectLifecycle = Boolean(
+                            targetEntityId && reportEntityOptions.some(opt => opt.id === targetEntityId)
+                          );
+
+                          return (
+                            <tr key={log.id} className="hover:bg-muted/20 transition-colors align-top">
+                              <td className="px-4 py-3 whitespace-nowrap font-mono text-muted-foreground">
+                                {formatDateTime(log.timestamp)}
+                              </td>
+                              <td className="px-4 py-3">
+                                <div className="space-y-1 min-w-[165px]">
+                                  <div className="flex flex-wrap items-center gap-1">
+                                    <span className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-800 text-[10px] font-bold uppercase">
+                                      {log.stage}
+                                    </span>
+                                    <span className="px-1.5 py-0.5 rounded bg-primary/10 text-primary text-[10px] font-bold uppercase">
+                                      {log.resolvedEntityType.replace(/_/g, ' ')}
+                                    </span>
+                                  </div>
+                                  <p className="font-bold text-foreground">{log.action}</p>
+                                  {log.entityTitle && <p className="font-semibold text-foreground">{log.entityTitle}</p>}
+                                  {log.entityId && <p className="text-[10px] font-mono text-muted-foreground">ID: {log.entityId}</p>}
+                                  <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                                    <button
+                                      type="button"
+                                      onClick={() => setSelectedReportAuditLog(log)}
+                                      className="text-[10px] font-bold text-primary hover:underline inline-flex items-center gap-1"
+                                    >
+                                      <Eye className="w-3 h-3" />
+                                      <span>Inspect Activity</span>
+                                    </button>
+                                    {canInspectLifecycle && selectedAuditEntityId !== targetEntityId && (
+                                      <button
+                                        type="button"
+                                        onClick={() => setSelectedAuditEntityId(String(targetEntityId))}
+                                        className="text-[10px] font-bold text-blue-700 hover:underline inline-flex items-center gap-1"
+                                      >
+                                        <History className="w-3 h-3" />
+                                        <span>Full Lifecycle</span>
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                              </td>
+                              <td className="px-4 py-3">
+                                <div className="space-y-1 min-w-[165px]">
+                                  <div>
+                                    <p className="text-[10px] font-bold uppercase text-muted-foreground">Performed By</p>
+                                    <p className="font-bold text-foreground">{log.actor.name}</p>
+                                    {log.actor.employeeId && (
+                                      <span className="inline-block px-1.5 py-0.5 rounded bg-muted font-mono text-[10px] font-semibold text-primary">
+                                        ID: {log.actor.employeeId}
+                                      </span>
+                                    )}
+                                    {log.actor.email && (
+                                      <p className="text-[11px] font-mono text-muted-foreground">{log.actor.email}</p>
+                                    )}
+                                    {log.actor.role && (
+                                      <p className="text-[10px] text-primary font-semibold">{log.actor.role}</p>
+                                    )}
+                                  </div>
+                                  {log.initiatedBy && log.initiatedBy.name !== log.actor.name && (
+                                    <div className="pt-1 border-t border-dashed">
+                                      <p className="text-[10px] font-bold uppercase text-blue-700">Initiated By</p>
+                                      <p className="text-[11px] font-semibold text-foreground">{formatActorInline(log.initiatedBy)}</p>
                                     </div>
-                                  ))}
+                                  )}
                                 </div>
-                              )}
-                              {log.details && Object.keys(log.details).length > 0 && (
-                                <div className="text-[11px] text-muted-foreground break-words">
-                                  {Object.entries(log.details)
-                                    .map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`)
-                                    .join(' • ')}
+                              </td>
+                              <td className="px-4 py-3">
+                                <div className="min-w-[250px] max-w-md space-y-2">
+                                  <div className="space-y-1">
+                                    <p className="text-[10px] font-bold uppercase text-muted-foreground flex items-center gap-1">
+                                      <Users className="w-3 h-3 text-primary" />
+                                      <span>Involved ({log.involvedParties.length})</span>
+                                    </p>
+                                    <div className="flex flex-wrap gap-1">
+                                      {log.involvedParties.slice(0, 4).map((p, pIdx) => (
+                                        <span key={pIdx} className="px-1.5 py-0.5 rounded bg-muted/60 border text-[10px]">
+                                          <strong className="text-primary">{p.roleInActivity}:</strong> {p.name}
+                                        </span>
+                                      ))}
+                                      {log.involvedParties.length > 4 && (
+                                        <button
+                                          type="button"
+                                          onClick={() => setSelectedReportAuditLog(log)}
+                                          className="px-1.5 py-0.5 rounded bg-primary/10 text-primary text-[10px] font-bold hover:underline"
+                                        >
+                                          +{log.involvedParties.length - 4} more
+                                        </button>
+                                      )}
+                                    </div>
+                                  </div>
+
+                                  {log.notifiedOnFinish.length > 0 && (
+                                    <div className="p-2 rounded-lg bg-amber-50/50 border border-amber-200/70 space-y-0.5">
+                                      <p className="text-[10px] font-bold uppercase text-amber-800 flex items-center gap-1">
+                                        <BellRing className="w-3 h-3" />
+                                        <span>Notified on Finish ({log.notifiedOnFinish.length})</span>
+                                      </p>
+                                      {log.notifiedOnFinish.slice(0, 3).map((n, nIdx) => (
+                                        <p key={nIdx} className="text-[11px] text-foreground leading-snug">• {n}</p>
+                                      ))}
+                                      {log.notifiedOnFinish.length > 3 && (
+                                        <button
+                                          type="button"
+                                          onClick={() => setSelectedReportAuditLog(log)}
+                                          className="text-[10px] font-bold text-amber-800 hover:underline"
+                                        >
+                                          View all {log.notifiedOnFinish.length} notified recipients
+                                        </button>
+                                      )}
+                                    </div>
+                                  )}
+
+                                  {log.nextAfterFinish && (
+                                    <div className="p-2 rounded-lg bg-emerald-50/50 border border-emerald-200/70 space-y-0.5">
+                                      <p className="text-[10px] font-bold uppercase text-emerald-700 flex items-center gap-1">
+                                        <ArrowRightCircle className="w-3 h-3" />
+                                        <span>Who Gets Next</span>
+                                      </p>
+                                      <p className="text-[11px] font-semibold text-foreground leading-snug">
+                                        {log.nextAfterFinish}
+                                      </p>
+                                    </div>
+                                  )}
                                 </div>
-                              )}
-                            </td>
-                          </tr>
-                        ))}
+                              </td>
+                              <td className="px-4 py-3 space-y-1.5 min-w-[220px] max-w-md">
+                                {Array.isArray(log.changes) && log.changes.length > 0 && (
+                                  <div className="bg-muted/40 p-2 rounded border space-y-0.5">
+                                    {log.changes.map((c, cIdx) => (
+                                      <div key={cIdx} className="flex flex-wrap gap-1.5">
+                                        <span className="font-bold">{c.field}:</span>
+                                        <span className="text-rose-600 line-through">{String(c.from ?? '-')}</span>
+                                        <span>-&gt;</span>
+                                        <span className="text-emerald-700 font-semibold">{String(c.to ?? '-')}</span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                                {detailPairs.length > 0 && (
+                                  <div className="grid grid-cols-1 gap-y-1 text-[11px]">
+                                    {detailPairs.map((pair, dIdx) => (
+                                      <div key={dIdx}>
+                                        <span className="font-bold text-muted-foreground">{pair.label}: </span>
+                                        <span className="text-foreground break-words">{pair.value}</span>
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                                {!log.changes?.length && detailPairs.length === 0 && (
+                                  <span className="text-muted-foreground">—</span>
+                                )}
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -2135,40 +2420,22 @@ export default function Reports() {
                 </div>
               </div>
 
-              {/* Report-Wise Audit Trail */}
-              <div className="space-y-3 bg-muted/20 p-5 rounded-xl border">
-                <h4 className="font-bold text-sm uppercase tracking-wider text-muted-foreground flex items-center gap-2">
-                  <History className="w-4 h-4 text-primary" />
-                  <span>Report Audit Trail ({individualAuditLogs.length})</span>
-                </h4>
-                {individualAuditLogs.length === 0 ? (
+              {/* Report-Wise Full Lifecycle Audit Trail */}
+              {individualLifecycleSummary ? (
+                <AuditLifecyclePanel
+                  summary={individualLifecycleSummary}
+                  compact
+                  title="Complete Report Audit Trail (Initiation to Closure)"
+                />
+              ) : (
+                <div className="space-y-3 bg-muted/20 p-5 rounded-xl border">
+                  <h4 className="font-bold text-sm uppercase tracking-wider text-muted-foreground flex items-center gap-2">
+                    <History className="w-4 h-4 text-primary" />
+                    <span>Report Audit Trail ({individualAuditLogs.length})</span>
+                  </h4>
                   <p className="text-xs text-muted-foreground">No audit events recorded for this report yet.</p>
-                ) : (
-                  <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
-                    {individualAuditLogs.map((log) => (
-                      <div key={log.id} className="bg-card p-3 rounded-lg border text-xs space-y-1">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <span className="font-bold text-foreground">{log.action}</span>
-                          <span className="font-mono text-[11px] text-muted-foreground">{formatDateTime(log.timestamp)}</span>
-                        </div>
-                        <p className="text-[11px] text-muted-foreground">By: {log.userEmail || log.userId || 'System'}</p>
-                        {Array.isArray(log.changes) && log.changes.length > 0 && (
-                          <div className="bg-muted/40 p-2 rounded border space-y-0.5 text-[11px]">
-                            {log.changes.map((c, idx) => (
-                              <div key={idx} className="flex flex-wrap gap-1.5">
-                                <span className="font-semibold">{c.field}:</span>
-                                <span className="text-rose-600 line-through">{String(c.from ?? '-')}</span>
-                                <span>-&gt;</span>
-                                <span className="text-emerald-700 font-semibold">{String(c.to ?? '-')}</span>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </div>
+                </div>
+              )}
             </div>
 
             <div className="p-6 border-t bg-muted/10 flex justify-end gap-3">
@@ -2187,6 +2454,65 @@ export default function Reports() {
               >
                 <Download className="w-4 h-4" />
                 Download PDF
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {selectedReportAuditLog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4">
+          <div className="bg-card w-full max-w-4xl max-h-[90vh] rounded-2xl border shadow-2xl flex flex-col overflow-hidden">
+            <div className="p-5 border-b flex items-center justify-between bg-muted/20">
+              <div>
+                <h3 className="text-lg font-bold text-foreground">
+                  Activity Details, Participants, Notifications &amp; Handoff
+                </h3>
+                <p className="text-xs text-muted-foreground">
+                  {selectedReportAuditLog.entityTitle || selectedReportAuditLog.action}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setSelectedReportAuditLog(null)}
+                className="p-2 hover:bg-accent rounded-full transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-5 overflow-y-auto flex-1">
+              <SingleActivityDetailCard log={selectedReportAuditLog} />
+            </div>
+            <div className="p-4 border-t bg-muted/10 flex justify-end gap-2">
+              {(() => {
+                const targetEntityId =
+                  selectedReportAuditLog.details?.submissionId ||
+                  selectedReportAuditLog.details?.registerId ||
+                  selectedReportAuditLog.entityId;
+                const canOpenLifecycle = Boolean(
+                  targetEntityId && reportEntityOptions.some(opt => opt.id === targetEntityId)
+                );
+                if (!canOpenLifecycle || selectedAuditEntityId === targetEntityId) return null;
+                return (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedAuditEntityId(String(targetEntityId));
+                      setSelectedReportAuditLog(null);
+                    }}
+                    className="px-4 py-2 bg-primary text-primary-foreground rounded-xl text-xs font-bold hover:opacity-90 flex items-center gap-1.5"
+                  >
+                    <History className="w-3.5 h-3.5" />
+                    <span>View Full Lifecycle for This Report</span>
+                  </button>
+                );
+              })()}
+              <button
+                type="button"
+                onClick={() => setSelectedReportAuditLog(null)}
+                className="px-5 py-2 border rounded-xl text-xs font-bold hover:bg-accent"
+              >
+                Close
               </button>
             </div>
           </div>

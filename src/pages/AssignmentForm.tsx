@@ -136,16 +136,16 @@ export default function AssignmentForm() {
         createdAssignments.push({ id: newId, template });
       }
 
-      if (formData.notificationEnabled && createdAssignments.length > 0) {
-        let recipients: User[] = [];
-        const targetIds = formData.targetIds || [];
-        
-        if (formData.type === 'individual') {
-          recipients = users.filter(u => targetIds.includes(u.uid));
-        } else {
-          recipients = users.filter(u => u.departmentId && targetIds.includes(u.departmentId));
-        }
+      const targetIds = formData.targetIds || [];
+      const targetRecipients: User[] =
+        formData.type === 'individual'
+          ? users.filter(u => targetIds.includes(u.uid))
+          : users.filter(u => u.departmentId && targetIds.includes(u.departmentId));
+      const assignedReviewer = users.find(u => u.uid === formData.reviewerId);
+      const notifiedList: string[] = [];
 
+      if (formData.notificationEnabled && createdAssignments.length > 0) {
+        const recipients = targetRecipients;
         const companyHeader = sanitizeReportBrandName(branding?.companyName) || 'Quality & Training Portal';
 
         for (const recipient of recipients) {
@@ -161,7 +161,11 @@ export default function AssignmentForm() {
             });
           }
 
-          if (!recipient.email) continue;
+          if (!recipient.email) {
+            notifiedList.push(`Trainee: ${recipient.displayName} (In-App Notification)`);
+            continue;
+          }
+          notifiedList.push(`Trainee: ${recipient.displayName} (${recipient.email}) — Email & In-App`);
           
           const assessmentListHtml = createdAssignments.map(item => {
             const assessmentLink = `${window.location.origin}/portal/${item.id}`;
@@ -240,10 +244,34 @@ export default function AssignmentForm() {
             read: false,
             link: '/submissions'
           });
+          if (assignedReviewer) {
+            notifiedList.push(`Assessor: ${assignedReviewer.displayName} (${assignedReviewer.email}) — In-App Notification`);
+          }
         }
       }
 
       const templateTitles = createdAssignments.map(a => a.template?.name).join(', ');
+      const involvedUsers = [
+        ...(currentUser ? [{
+          name: currentUser.displayName,
+          email: currentUser.email,
+          employeeId: currentUser.employeeId,
+          roleInActivity: 'Initiator / Assigner'
+        }] : []),
+        ...targetRecipients.map(r => ({
+          name: r.displayName,
+          email: r.email,
+          employeeId: r.employeeId,
+          roleInActivity: 'Assigned Trainee'
+        })),
+        ...(assignedReviewer ? [{
+          name: assignedReviewer.displayName,
+          email: assignedReviewer.email,
+          employeeId: assignedReviewer.employeeId,
+          roleInActivity: 'Assigned Assessor'
+        }] : [])
+      ];
+
       await firestoreService.logActivity(
         'Created Assessment Assignments',
         'Assignments',
@@ -253,7 +281,17 @@ export default function AssignmentForm() {
           templateNames: templateTitles,
           targetCount: formData.targetIds?.length,
           reviewerId: formData.reviewerId,
-          type: formData.type
+          assessorName: assignedReviewer?.displayName || formData.reviewerId,
+          dueDate: formData.dueDate,
+          type: formData.type,
+          initiatedByUid: currentUser?.uid,
+          initiatedByName: currentUser?.displayName,
+          initiatedByEmail: currentUser?.email,
+          initiatedByEmployeeId: currentUser?.employeeId,
+          involvedUsers,
+          notifiedRecipients: notifiedList,
+          nextStepOwner: targetRecipients.map(r => `${r.displayName}${r.email ? ` (${r.email})` : ''}`).join(', ') || 'Assigned Trainees',
+          nextStepAction: `Start and complete assessment(s) before Due Date (${formData.dueDate}), then submit to Assessor ${assignedReviewer?.displayName || ''}`
         },
         currentUser?.uid,
         currentUser?.email,

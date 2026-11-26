@@ -42,6 +42,8 @@ import { formatDate, formatDateTime, cn } from '../lib/utils';
 import { trainingRegisterService, DEFAULT_TEMPLATE_CONFIG } from '../services/trainingRegisterService';
 import { SignaturePadModal } from '../components/SignaturePadModal';
 import { sanitizeReportBrandName } from '../utils/pdfBranding';
+import { AuditLifecyclePanel } from '../components/AuditLifecyclePanel';
+import { buildTrainingRegisterLifecycle } from '../utils/auditLifecycle';
 
 const isSafeHttpUrl = (url?: string): boolean => {
   if (!url) return false;
@@ -66,6 +68,7 @@ export default function TrainingRegisterDetail() {
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
   const [users, setUsers] = useState<UserType[]>([]);
+  const [allUsersForAudit, setAllUsersForAudit] = useState<UserType[]>([]);
   const [templateConfig, setTemplateConfig] = useState<TrainingRegisterTemplateConfig>(DEFAULT_TEMPLATE_CONFIG);
   const [isCustomTrainer, setIsCustomTrainer] = useState(false);
   const [autoPrompted, setAutoPrompted] = useState(false);
@@ -205,6 +208,7 @@ export default function TrainingRegisterDetail() {
           firestoreService.getCollection<UserType>('users')
         ]);
         setTemplateConfig(loadedConfig);
+        setAllUsersForAudit(allUsers);
         setUsers(allUsers.filter((u) => u.status === 'active'));
 
         if (!isNew && id) {
@@ -454,6 +458,31 @@ export default function TrainingRegisterDetail() {
 
       let docId = formData.id;
       const changes: AuditChange[] = [];
+      const firstAtt = preparedAttendees[0];
+      const launchNotified =
+        shouldLaunchWorkflow && firstAtt
+          ? [`Attendee #1: ${firstAtt.traineeName}${firstAtt.email ? ` (${firstAtt.email})` : ''} — Email & In-App Invitation`]
+          : [];
+      const registerInvolvedUsers = [
+        {
+          name: formData.createdByName || currentUser?.displayName || 'Initiator',
+          email: currentUser?.email,
+          employeeId: currentUser?.employeeId,
+          roleInActivity: 'Initiator'
+        },
+        {
+          name: formData.trainerName,
+          email: trainerEmailToSave,
+          roleInActivity: 'Designated Trainer'
+        },
+        ...preparedAttendees.map(a => ({
+          name: a.traineeName,
+          email: a.email,
+          employeeId: a.employeeId,
+          roleInActivity: `Attendee #${a.slNo}`
+        }))
+      ];
+
       if (isNew || !docId) {
         // Exclude empty id from initial create payload
         const { id: _unused, ...dataToCreate } = payload;
@@ -464,7 +493,24 @@ export default function TrainingRegisterDetail() {
         await firestoreService.logActivity(
           shouldLaunchWorkflow ? 'Created & Started Training Register' : 'Created Training Register Draft',
           'Training Registers',
-          { id: docId, title: formData.trainingTitle, attendeesCount: preparedAttendees.length },
+          {
+            id: docId,
+            registerId: docId,
+            title: formData.trainingTitle,
+            attendeesCount: preparedAttendees.length,
+            initiatedByUid: currentUser?.uid,
+            initiatedByName: currentUser?.displayName,
+            initiatedByEmail: currentUser?.email,
+            initiatedByEmployeeId: currentUser?.employeeId,
+            involvedUsers: registerInvolvedUsers,
+            notifiedRecipients: launchNotified,
+            nextStepOwner: shouldLaunchWorkflow && firstAtt
+              ? `Attendee #1: ${firstAtt.traineeName}${firstAtt.email ? ` (${firstAtt.email})` : ''}`
+              : `${currentUser?.displayName || 'Initiator'}`,
+            nextStepAction: shouldLaunchWorkflow && firstAtt
+              ? 'Review SOP document and provide Attendee #1 digital signature'
+              : 'Review attendees and launch signing workflow'
+          },
           currentUser?.uid,
           currentUser?.email,
           {
@@ -507,10 +553,31 @@ export default function TrainingRegisterDetail() {
           }
         }
 
+        const pendingSigner = preparedAttendees.find(a => a.status === 'pending') || firstAtt;
         await firestoreService.logActivity(
           shouldLaunchWorkflow ? 'Started Signing Workflow' : 'Updated Training Register',
           'Training Registers',
-          { id: docId, title: formData.trainingTitle, workflowStatus: nextStatus },
+          {
+            id: docId,
+            registerId: docId,
+            title: formData.trainingTitle,
+            workflowStatus: nextStatus,
+            initiatedByUid: formData.createdBy,
+            initiatedByName: formData.createdByName,
+            involvedUsers: registerInvolvedUsers,
+            notifiedRecipients: launchNotified,
+            nextStepOwner:
+              nextStatus === 'in_progress' && pendingSigner
+                ? `Attendee #${pendingSigner.slNo}: ${pendingSigner.traineeName}${pendingSigner.email ? ` (${pendingSigner.email})` : ''}`
+                : nextStatus === 'awaiting_trainer'
+                ? `Trainer: ${formData.trainerName}${trainerEmailToSave ? ` (${trainerEmailToSave})` : ''}`
+                : nextStatus === 'completed'
+                ? 'Completed (QA & IT Notified)'
+                : `${formData.createdByName || currentUser?.displayName || 'Initiator'}`,
+            nextStepAction: shouldLaunchWorkflow
+              ? 'Sequential SOP document review & digital signature workflow started'
+              : 'Training register record updated'
+          },
           currentUser?.uid,
           currentUser?.email,
           {
@@ -715,8 +782,28 @@ export default function TrainingRegisterDetail() {
           'Training Registers',
           {
             id: nextRegister.id,
+            registerId: nextRegister.id,
             documentTitle: nextRegister.documentTitle || nextRegister.trainingTitle,
-            role: isTrainerAccount ? 'Trainer' : 'Attendee'
+            role: isTrainerAccount ? 'Trainer' : 'Attendee',
+            initiatedByUid: nextRegister.createdBy,
+            initiatedByName: nextRegister.createdByName,
+            involvedUsers: [
+              {
+                name: currentUser.displayName,
+                email: currentUser.email,
+                employeeId: currentUser.employeeId,
+                roleInActivity: isTrainerAccount ? 'Trainer (Document Reviewer)' : 'Attendee (Document Reviewer)'
+              },
+              ...(isTrainerAccount
+                ? []
+                : [{
+                    name: nextRegister.trainerName,
+                    email: nextRegister.trainerEmail,
+                    roleInActivity: 'Designated Trainer'
+                  }])
+            ],
+            nextStepOwner: `${currentUser.displayName} (${currentUser.email})`,
+            nextStepAction: 'Digital signature unlocked — provide signature on the register'
           },
           currentUser.uid,
           currentUser.email,
@@ -775,10 +862,52 @@ export default function TrainingRegisterDetail() {
       setFormData(updatedRegister);
       await firestoreService.updateDocument('training_registers', updatedRegister.id, updatedRegister);
 
+      const qaAndItNotified = [
+        ...(templateConfig.qualityTeamEmails || []).filter(Boolean).map(e => `QA Team (${e}) — Completed Register Email`),
+        ...(templateConfig.itTeamEmails || []).filter(Boolean).map(e => `IT Team (${e}) — Completed Register Email`)
+      ];
+
       await firestoreService.logActivity(
         'Completed Training Register (Trainer Sign-off)',
         'Training Registers',
-        { id: updatedRegister.id, trainerName: updatedRegister.trainerName, signedDate: formattedDate },
+        {
+          id: updatedRegister.id,
+          registerId: updatedRegister.id,
+          trainerName: updatedRegister.trainerName,
+          signedDate: formattedDate,
+          initiatedByUid: updatedRegister.createdBy,
+          initiatedByName: updatedRegister.createdByName,
+          involvedUsers: [
+            ...(updatedRegister.createdByName ? [{
+              name: updatedRegister.createdByName,
+              roleInActivity: 'Initiator'
+            }] : []),
+            {
+              name: updatedRegister.trainerName,
+              email: updatedRegister.trainerEmail,
+              roleInActivity: 'Designated Trainer (Closed Register)'
+            },
+            ...(updatedRegister.attendees || []).map(a => ({
+              name: a.traineeName,
+              email: a.email,
+              employeeId: a.employeeId,
+              roleInActivity: `Attendee #${a.slNo} (${a.status})`
+            })),
+            ...(templateConfig.qualityTeamEmails || []).filter(Boolean).map(e => ({
+              name: 'Quality Team',
+              email: e,
+              roleInActivity: 'QA Notified'
+            })),
+            ...(templateConfig.itTeamEmails || []).filter(Boolean).map(e => ({
+              name: 'IT Team',
+              email: e,
+              roleInActivity: 'IT Notified'
+            }))
+          ],
+          notifiedRecipients: qaAndItNotified,
+          nextStepOwner: 'Quality Assurance (QA) & IT Administration',
+          nextStepAction: 'Training Register completed, verified & archived for compliance'
+        },
         currentUser?.uid,
         currentUser?.email,
         {
@@ -863,10 +992,50 @@ export default function TrainingRegisterDetail() {
     setFormData(updatedRegister);
     await firestoreService.updateDocument('training_registers', updatedRegister.id, updatedRegister);
 
+    const nextAttendeeForAudit = nextIndex < updatedAttendees.length ? updatedAttendees[nextIndex] : null;
+    const signNotifiedRecipients = nextAttendeeForAudit
+      ? [`Next Attendee #${nextAttendeeForAudit.slNo}: ${nextAttendeeForAudit.traineeName}${nextAttendeeForAudit.email ? ` (${nextAttendeeForAudit.email})` : ''} — Email & In-App Notification`]
+      : [`Designated Trainer: ${updatedRegister.trainerName}${updatedRegister.trainerEmail ? ` (${updatedRegister.trainerEmail})` : ''} — Email & In-App Notification`];
+
     await firestoreService.logActivity(
       'Signed Training Register (Trainee)',
       'Training Registers',
-      { id: updatedRegister.id, attendee: attendee.traineeName, slNo: attendee.slNo, signedDate: formattedDate },
+      {
+        id: updatedRegister.id,
+        registerId: updatedRegister.id,
+        attendee: attendee.traineeName,
+        slNo: attendee.slNo,
+        signedDate: formattedDate,
+        initiatedByUid: updatedRegister.createdBy,
+        initiatedByName: updatedRegister.createdByName,
+        involvedUsers: [
+          {
+            name: attendee.traineeName,
+            email: attendee.email,
+            employeeId: attendee.employeeId,
+            roleInActivity: `Attendee #${attendee.slNo} (Signed)`
+          },
+          nextAttendeeForAudit
+            ? {
+                name: nextAttendeeForAudit.traineeName,
+                email: nextAttendeeForAudit.email,
+                employeeId: nextAttendeeForAudit.employeeId,
+                roleInActivity: `Next Signer (Attendee #${nextAttendeeForAudit.slNo})`
+              }
+            : {
+                name: updatedRegister.trainerName,
+                email: updatedRegister.trainerEmail,
+                roleInActivity: 'Next Signer (Designated Trainer)'
+              }
+        ],
+        notifiedRecipients: signNotifiedRecipients,
+        nextStepOwner: nextAttendeeForAudit
+          ? `Attendee #${nextAttendeeForAudit.slNo}: ${nextAttendeeForAudit.traineeName}${nextAttendeeForAudit.email ? ` (${nextAttendeeForAudit.email})` : ''}`
+          : `Designated Trainer: ${updatedRegister.trainerName}${updatedRegister.trainerEmail ? ` (${updatedRegister.trainerEmail})` : ''}`,
+        nextStepAction: nextAttendeeForAudit
+          ? `Review SOP document and provide Attendee #${nextAttendeeForAudit.slNo} digital signature`
+          : 'All attendees signed — Trainer to review document and provide final closing sign-off'
+      },
       currentUser?.uid,
       currentUser?.email,
       {
@@ -2008,87 +2177,17 @@ export default function TrainingRegisterDetail() {
         </div>
       </div>
 
-      {/* REPORT-WISE AUDIT TRAIL */}
-      {!isNew && (
-        <div className="bg-card border rounded-2xl shadow-sm p-6 space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="flex items-center gap-2.5">
-              <div className="p-2 rounded-xl bg-primary/10 text-primary">
-                <History className="w-5 h-5" />
-              </div>
-              <div>
-                <h3 className="text-base font-bold">Register Audit Trail</h3>
-                <p className="text-xs text-muted-foreground">
-                  Chronological history of updates, document reviews, signatures, and exports for this training register.
-                </p>
-              </div>
-            </div>
-            {registerAuditLogs.length > 0 && (
-              <button
-                type="button"
-                onClick={() => {
-                  const headers = ['Timestamp', 'User', 'Action', 'Details', 'Field Changes'];
-                  const rows = registerAuditLogs.map((l) => [
-                    l.timestamp,
-                    l.userEmail || l.userId,
-                    l.action,
-                    JSON.stringify(l.details || {}),
-                    (l.changes || []).map((c) => `${c.field}: ${c.from} -> ${c.to}`).join('; ')
-                  ]);
-                  const csv = [headers, ...rows]
-                    .map((r) => r.map((v) => `"${String(v || '').replace(/"/g, '""')}"`).join(','))
-                    .join('\n');
-                  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-                  const url = URL.createObjectURL(blob);
-                  const a = document.createElement('a');
-                  a.href = url;
-                  a.download = `register_audit_${formData.id || 'log'}.csv`;
-                  a.click();
-                  URL.revokeObjectURL(url);
-                }}
-                className="flex items-center gap-1.5 px-3 py-1.5 border rounded-lg text-xs font-semibold hover:bg-accent transition-colors"
-              >
-                <Download className="w-3.5 h-3.5" />
-                Export Audit CSV
-              </button>
-            )}
-          </div>
-
-          {registerAuditLogs.length === 0 ? (
-            <div className="p-6 text-center text-xs text-muted-foreground border rounded-xl bg-muted/20">
-              No audit activities recorded yet for this training register.
-            </div>
-          ) : (
-            <div className="divide-y border rounded-xl overflow-hidden">
-              {registerAuditLogs.map((log) => (
-                <div key={log.id} className="p-3.5 bg-background hover:bg-muted/20 transition-colors space-y-1.5">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="flex items-center gap-2">
-                      <span className="px-2 py-0.5 rounded-md bg-primary/10 text-primary text-xs font-bold">
-                        {log.action}
-                      </span>
-                      <span className="text-xs font-medium text-foreground">
-                        {log.userEmail || log.userId}
-                      </span>
-                    </div>
-                    <span className="text-[11px] font-mono text-muted-foreground">
-                      {formatDateTime(log.timestamp)}
-                    </span>
-                  </div>
-                  {log.changes && log.changes.length > 0 && (
-                    <div className="flex flex-wrap gap-1.5 pt-1">
-                      {log.changes.map((c, idx) => (
-                        <span key={idx} className="text-[11px] px-2 py-0.5 rounded bg-muted/60 border font-mono">
-                          <strong>{c.field}:</strong> {String(c.from ?? '—')} &rarr; {String(c.to ?? '—')}
-                        </span>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+      {/* REPORT-WISE FULL LIFECYCLE AUDIT TRAIL */}
+      {!isNew && formData.id && (
+        <AuditLifecyclePanel
+          summary={buildTrainingRegisterLifecycle({
+            register: formData,
+            users: allUsersForAudit.length > 0 ? allUsersForAudit : users,
+            logs: registerAuditLogs,
+            templateConfig
+          })}
+          title="Register Audit Trail (Initiation to Closure)"
+        />
       )}
 
       {/* Delete confirmation modal */}

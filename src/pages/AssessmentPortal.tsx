@@ -351,7 +351,19 @@ export default function AssessmentPortal() {
             templateId: template.id,
             templateName: template.name,
             templateVersion: template.version || 'V1.0',
-            employeeId: user.uid
+            employeeId: user.uid,
+            reviewerId: assignment.reviewerId,
+            initiatedByUid: assignment.assignedBy,
+            involvedUsers: [
+              {
+                name: user.displayName,
+                email: user.email,
+                employeeId: user.employeeId,
+                roleInActivity: 'Trainee / Candidate'
+              }
+            ],
+            nextStepOwner: `${user.displayName} (${user.email})`,
+            nextStepAction: 'Complete all assessment questions and submit for evaluation'
           },
           user.uid,
           user.email,
@@ -406,39 +418,30 @@ export default function AssessmentPortal() {
       // 3. Process email notifications and activity logging asynchronously in background
       (async () => {
         try {
-          firestoreService.logActivity(
-            'Submitted Assessment',
-            'Assessments',
-            { 
-              submissionId,
-              assignmentId, 
-              templateName: template?.name,
-              templateVersion: template?.version || 'V1.0',
-              employeeId: user?.uid,
-              tabSwitchCount
-            },
-            user?.uid,
-            user?.email,
-            {
-              entityType: 'assessment_report',
-              entityId: submissionId,
-              entityTitle: `${template?.name || 'Assessment'} — ${user?.displayName || user?.email}`
-            }
-          ).catch(console.error);
+          const [reviewerUser, assignerUser] = await Promise.all([
+            assignment?.reviewerId ? firestoreService.getDocument<User>('users', assignment.reviewerId).catch(() => null) : Promise.resolve(null),
+            assignment?.assignedBy ? firestoreService.getDocument<User>('users', assignment.assignedBy).catch(() => null) : Promise.resolve(null)
+          ]);
+
+          const submitNotified: string[] = [
+            reviewerUser
+              ? `Assigned Assessor: ${reviewerUser.displayName} (${reviewerUser.email}) — ${reviewerUser.email ? 'Email & ' : ''}In-App Notification`
+              : `Assigned Assessor (${assignment?.reviewerId || 'Reviewer'}) — Evaluation Notification`
+          ];
 
           const portalOrgName = sanitizeReportBrandName(branding?.companyName || branding?.appName) || 'Enterprise Assessment Portal';
 
           // Notify Reviewer & Admins if tab switching occurred
           if (tabSwitchCount > 0) {
-            const [allUsers, reviewer] = await Promise.all([
-              firestoreService.getCollection<User>('users'),
-              assignment?.reviewerId ? firestoreService.getDocument<User>('users', assignment.reviewerId) : Promise.resolve(null)
-            ]);
+            const allUsers = await firestoreService.getCollection<User>('users');
             const adminEmails = allUsers
               .filter(u => u.status !== 'inactive' && ((u.roles && u.roles.includes('super_admin')) || u.role === 'super_admin'))
               .map(u => u.email)
               .filter(Boolean);
-            const recipients = Array.from(new Set([...adminEmails, reviewer?.email].filter(Boolean) as string[]));
+            const recipients = Array.from(new Set([...adminEmails, reviewerUser?.email].filter(Boolean) as string[]));
+            for (const rEmail of recipients) {
+              submitNotified.push(`Security Alert (Tab Switch x${tabSwitchCount}): ${rEmail}`);
+            }
 
             for (const recipient of recipients) {
               const emailData = {
@@ -479,9 +482,59 @@ export default function AssessmentPortal() {
             }
           }
 
+          firestoreService.logActivity(
+            'Submitted Assessment',
+            'Assessments',
+            { 
+              submissionId,
+              assignmentId, 
+              templateName: template?.name,
+              templateVersion: template?.version || 'V1.0',
+              employeeId: user?.uid,
+              reviewerId: assignment?.reviewerId,
+              tabSwitchCount,
+              initiatedByUid: assignerUser?.uid || assignment?.assignedBy,
+              initiatedByName: assignerUser?.displayName,
+              initiatedByEmail: assignerUser?.email,
+              initiatedByEmployeeId: assignerUser?.employeeId,
+              involvedUsers: [
+                ...(assignerUser ? [{
+                  name: assignerUser.displayName,
+                  email: assignerUser.email,
+                  employeeId: assignerUser.employeeId,
+                  roleInActivity: 'Initiator / Assigner'
+                }] : []),
+                ...(user ? [{
+                  name: user.displayName,
+                  email: user.email,
+                  employeeId: user.employeeId,
+                  roleInActivity: 'Trainee / Submitter'
+                }] : []),
+                ...(reviewerUser ? [{
+                  name: reviewerUser.displayName,
+                  email: reviewerUser.email,
+                  employeeId: reviewerUser.employeeId,
+                  roleInActivity: 'Next Owner (Assessor)'
+                }] : [])
+              ],
+              notifiedRecipients: submitNotified,
+              nextStepOwner: reviewerUser
+                ? `${reviewerUser.displayName} (${reviewerUser.email})`
+                : (assignment?.reviewerId || 'Assigned Assessor'),
+              nextStepAction: 'Perform Assessor evaluation, score answers, and finalize report'
+            },
+            user?.uid,
+            user?.email,
+            {
+              entityType: 'assessment_report',
+              entityId: submissionId,
+              entityTitle: `${template?.name || 'Assessment'} — ${user?.displayName || user?.email}`
+            }
+          ).catch(console.error);
+
           // Notify Assigned Assessor of completion (standard)
           if (assignment?.reviewerId) {
-            const reviewer = await firestoreService.getDocument<User>('users', assignment.reviewerId);
+            const reviewer = reviewerUser || await firestoreService.getDocument<User>('users', assignment.reviewerId);
             if (reviewer?.uid) {
               firestoreService.createDocument('notifications', {
                 userId: reviewer.uid,

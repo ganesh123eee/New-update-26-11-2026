@@ -222,6 +222,75 @@ export default function EvaluationForm() {
         reviewedAt
       };
 
+      const initiatorUser = allUsersList.find(
+        u => u.uid === assignment?.assignedBy || u.email === assignment?.assignedBy
+      );
+      const qaUsersPre = allUsersList.filter(u => {
+        if (u.status === 'inactive') return false;
+        const uRoles = u.roles && u.roles.length > 0 ? u.roles : (u.role ? [u.role] : []);
+        return uRoles.includes('quality_management');
+      });
+      let configuredQaEmailsPre: string[] = [];
+      try {
+        const regConfigPre = await trainingRegisterService.getTemplateConfig();
+        configuredQaEmailsPre = regConfigPre.qualityTeamEmails || [];
+      } catch {
+        configuredQaEmailsPre = [];
+      }
+      const uniqueQaEmailsPre = Array.from(
+        new Set([
+          ...qaUsersPre.map(u => u.email).filter(Boolean),
+          ...configuredQaEmailsPre.filter(Boolean)
+        ].map(e => e.trim().toLowerCase()))
+      );
+
+      const notifiedRecipientsList: string[] = [];
+      if (employee) {
+        notifiedRecipientsList.push(
+          `Trainee: ${employee.displayName || employee.email}${employee.email ? ` (${employee.email})` : ''} — Email & In-App`
+        );
+      }
+      const assessorEmailPre = assignedReviewerUser?.email || reviewer?.email;
+      notifiedRecipientsList.push(
+        `Assessor: ${assignedReviewerName}${assessorEmailPre ? ` (${assessorEmailPre})` : ''} — Email & In-App`
+      );
+      for (const qaEmail of uniqueQaEmailsPre) {
+        const matchedQa = qaUsersPre.find(u => u.email?.toLowerCase() === qaEmail);
+        notifiedRecipientsList.push(
+          `QA: ${matchedQa?.displayName || 'Quality Assurance'} (${qaEmail}) — Email${matchedQa?.uid ? ' & In-App' : ''}`
+        );
+      }
+
+      const involvedUsers = [
+        ...(initiatorUser ? [{
+          name: initiatorUser.displayName,
+          email: initiatorUser.email,
+          employeeId: initiatorUser.employeeId,
+          roleInActivity: 'Initiator / Assigner'
+        }] : []),
+        ...(employee ? [{
+          name: employee.displayName,
+          email: employee.email,
+          employeeId: employee.employeeId,
+          roleInActivity: 'Trainee / Candidate'
+        }] : []),
+        ...(reviewer ? [{
+          name: reviewer.displayName,
+          email: reviewer.email,
+          employeeId: reviewer.employeeId,
+          roleInActivity: 'Assigned Assessor (Closed)'
+        }] : []),
+        ...uniqueQaEmailsPre.map(qaEmail => {
+          const matchedQa = qaUsersPre.find(u => u.email?.toLowerCase() === qaEmail);
+          return {
+            name: matchedQa?.displayName || 'Quality Assurance',
+            email: qaEmail,
+            employeeId: matchedQa?.employeeId,
+            roleInActivity: 'QA (Completion Notified)'
+          };
+        })
+      ];
+
       await Promise.all([
         firestoreService.createDocument('reviews', data),
         firestoreService.updateDocument('submissions', submissionId!, { status: 'completed' }),
@@ -237,7 +306,19 @@ export default function EvaluationForm() {
             score: finalScore,
             result: evaluation.result,
             retestRequired: Boolean(evaluation.retestRequired),
-            assessor: reviewer?.displayName || reviewer?.email
+            assessor: reviewer?.displayName || reviewer?.email,
+            initiatedByUid: initiatorUser?.uid || assignment?.assignedBy,
+            initiatedByName: initiatorUser?.displayName,
+            initiatedByEmail: initiatorUser?.email,
+            initiatedByEmployeeId: initiatorUser?.employeeId,
+            involvedUsers,
+            notifiedRecipients: notifiedRecipientsList,
+            nextStepOwner: evaluation.retestRequired
+              ? `HR/QM & Trainee (${employee?.displayName || 'Candidate'})`
+              : `Quality Assurance (QA) & Trainee (${employee?.displayName || 'Candidate'})`,
+            nextStepAction: evaluation.retestRequired
+              ? 'Re-assessment assignment required; final evaluation shared with Trainee, Assessor & QA'
+              : 'Evaluation closed & finalized report delivered to Trainee, Assessor & QA'
           },
           reviewer?.uid,
           reviewer?.email,
