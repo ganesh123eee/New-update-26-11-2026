@@ -10,7 +10,13 @@ import {
   TrainingRegisterTemplateConfig,
   User
 } from '../types';
-import { AuditEntityCategory, inferAuditEntityType } from '../services/firestoreService';
+import {
+  AuditEntityCategory,
+  inferAuditEntityType,
+  inferAuditReason,
+  inferAuditStage as inferDefaultAuditWhen
+} from '../services/firestoreService';
+import { formatQuestionnaireVersion } from '../lib/utils';
 
 export interface ResolvedActor {
   uid?: string;
@@ -38,8 +44,10 @@ export type LifecycleStage =
 export interface LifecycleTimelineEvent {
   id: string;
   stage: LifecycleStage;
+  when: string;
   timestamp: string;
   action: string;
+  why: string;
   actor: ResolvedActor;
   initiatedBy?: ResolvedActor;
   involvedParties: ActivityParticipant[];
@@ -84,6 +92,8 @@ export interface AuditEnrichmentContext {
 export interface EnrichedAuditLog extends AuditLog {
   resolvedEntityType: AuditEntityCategory;
   stage: LifecycleStage;
+  when: string;
+  why: string;
   actor: ResolvedActor;
   initiatedBy?: ResolvedActor;
   involvedParties: ActivityParticipant[];
@@ -380,7 +390,7 @@ export function enrichAuditLogEntry(
           list.push({ ...actor, roleInActivity: det.role || `Attendee${det.slNo ? ` #${det.slNo}` : ''}` });
         } else {
           for (const a of matchedReg.attendees || []) {
-            const aa = resolveActorInfo(a.employeeId || a.email, users, a.traineeName, a.email);
+            const aa = resolveActorInfo(a.userId || a.employeeId || a.email, users, a.traineeName, a.email);
             list.push({ ...aa, roleInActivity: `Attendee #${a.slNo}` });
           }
         }
@@ -516,10 +526,15 @@ export function enrichAuditLogEntry(
     initiatedBy = actor;
   }
 
+  const when = log.when || inferDefaultAuditWhen(log.action, log.module, log.details);
+  const why = log.why || inferAuditReason(log.action, log.module, log.details);
+
   return {
     ...log,
     resolvedEntityType,
     stage,
+    when,
+    why,
     actor,
     initiatedBy,
     involvedParties,
@@ -621,7 +636,8 @@ export function buildEvaluationReportLifecycle(params: {
   const targetCandidates = resolveAssignmentTargets(assignment, users);
   const qaRecipients = resolveQaRecipients(users, templateConfig);
 
-  const entityTitle = `${template?.name || 'Assessment'} (${template?.version || 'V1.0'}) — ${
+  const templateVer = formatQuestionnaireVersion(template?.version);
+  const entityTitle = `${template?.name || 'Assessment'}${templateVer ? ` (${templateVer})` : ''} — ${
     submission ? candidateActor.name : targetCandidates.map((t) => t.name).join(', ') || 'Assigned'
   }`;
 
@@ -678,8 +694,10 @@ export function buildEvaluationReportLifecycle(params: {
     events.push({
       id: assignCreateLog?.id || `init-${entityId}`,
       stage: 'Initiation',
+      when: assignCreateLog?.when || inferDefaultAuditWhen(assignCreateLog?.action || 'Assigned Assessment', 'Assignments', assignCreateLog?.details),
       timestamp: initiatedAt,
       action: assignCreateLog?.action || 'Assessment Initiated & Assigned',
+      why: assignCreateLog?.why || inferAuditReason(assignCreateLog?.action || 'Assigned Assessment', 'Assignments', assignCreateLog?.details),
       actor: initiatorActor,
       initiatedBy: initiatorActor,
       involvedParties: dedupeParticipants([
@@ -697,12 +715,12 @@ export function buildEvaluationReportLifecycle(params: {
       entityId,
       entityTitle,
       source: assignCreateLog ? 'audit_log' : 'record_state',
-      summary: `Initiated by ${initiatorActor.name}. Assigned "${template?.name || 'Assessment'}" (${template?.version || 'V1.0'}) to ${targetNames || 'candidate(s)'} with Assessor ${assessorActor?.name || 'N/A'}.`,
+      summary: `Initiated by ${initiatorActor.name}. Assigned "${template?.name || 'Assessment'}"${templateVer ? ` (${templateVer})` : ''} to ${targetNames || 'candidate(s)'} with Assessor ${assessorActor?.name || 'N/A'}.`,
       changes: assignCreateLog?.changes,
       details: {
         ...(assignCreateLog?.details || {}),
         templateName: template?.name || 'Assessment',
-        templateVersion: template?.version || 'V1.0',
+        ...(templateVer ? { templateVersion: templateVer } : {}),
         documentCode: template?.documentCode || 'N/A',
         assignmentId: assignment?.id || assignCreateLog?.details?.assignmentId,
         assignmentMode: assignment?.type || assignCreateLog?.details?.type || 'individual',
@@ -723,8 +741,10 @@ export function buildEvaluationReportLifecycle(params: {
     events.push({
       id: startedLog?.id || `start-${submission.id}`,
       stage: 'In Progress',
+      when: startedLog?.when || inferDefaultAuditWhen(startedLog?.action || 'Started Assessment', 'Assessments', startedLog?.details),
       timestamp: startedAt || submission.submittedAt,
       action: startedLog?.action || 'Started Assessment',
+      why: startedLog?.why || inferAuditReason(startedLog?.action || 'Started Assessment', 'Assessments', startedLog?.details),
       actor: candidateActor,
       initiatedBy: initiatorActor,
       involvedParties: dedupeParticipants([
@@ -747,7 +767,7 @@ export function buildEvaluationReportLifecycle(params: {
         employeeId: candidateActor.employeeId || submission.employeeId,
         department: deptName || 'N/A',
         templateName: template?.name || 'Assessment',
-        templateVersion: template?.version || 'V1.0'
+        ...(templateVer ? { templateVersion: templateVer } : {})
       }
     });
   }
@@ -774,8 +794,10 @@ export function buildEvaluationReportLifecycle(params: {
     events.push({
       id: submittedLog?.id || `submit-${submission.id}`,
       stage: 'In Progress',
+      when: submittedLog?.when || inferDefaultAuditWhen(submittedLog?.action || 'Submitted Assessment', 'Assessments', submittedLog?.details),
       timestamp: submittedLog?.timestamp || submission.submittedAt,
       action: submittedLog?.action || 'Submitted Assessment',
+      why: submittedLog?.why || inferAuditReason(submittedLog?.action || 'Submitted Assessment', 'Assessments', submittedLog?.details),
       actor: candidateActor,
       initiatedBy: initiatorActor,
       involvedParties: dedupeParticipants([
@@ -844,8 +866,10 @@ export function buildEvaluationReportLifecycle(params: {
     events.push({
       id: evaluatedLog?.id || `eval-${evaluation?.id || entityId}`,
       stage: 'Closing',
+      when: evaluatedLog?.when || inferDefaultAuditWhen(evaluatedLog?.action || 'Completed Evaluation', 'Evaluations', evaluatedLog?.details),
       timestamp: evalTimestamp,
       action: evaluatedLog?.action || 'Completed Evaluation & Closed Report',
+      why: evaluatedLog?.why || inferAuditReason(evaluatedLog?.action || 'Completed Evaluation', 'Evaluations', evaluatedLog?.details),
       actor: evalActor,
       initiatedBy: initiatorActor,
       involvedParties: dedupeParticipants([
@@ -875,8 +899,6 @@ export function buildEvaluationReportLifecycle(params: {
         finalScore: scoreVal !== undefined ? `${Number(scoreVal).toFixed(1)}%` : 'N/A',
         result: resultVal || 'N/A',
         retestRequired: retest,
-        strengths: evaluation?.strengths || 'N/A',
-        improvements: evaluation?.improvements || 'N/A',
         overallComments: evaluation?.overallComments || 'N/A'
       }
     });
@@ -896,8 +918,10 @@ export function buildEvaluationReportLifecycle(params: {
     events.push({
       id: log.id,
       stage: enriched.stage,
+      when: enriched.when,
       timestamp: log.timestamp,
       action: log.action,
+      why: enriched.why,
       actor: enriched.actor,
       initiatedBy: enriched.initiatedBy || initiatorActor,
       involvedParties: enriched.involvedParties,
@@ -949,7 +973,7 @@ export function buildEvaluationReportLifecycle(params: {
         : sortedEvents[sortedEvents.length - 1]?.notifiedOnFinish || [],
     nextStepSummary,
     metrics: [
-      { label: 'Template & Version', value: `${template?.name || 'Assessment'} (${template?.version || 'V1.0'})` },
+      { label: 'Template & Version', value: `${template?.name || 'Assessment'}${templateVer ? ` (${templateVer})` : ''}` },
       { label: 'Final Score', value: evaluation ? `${evaluation.finalScore.toFixed(1)}%` : 'Pending' },
       { label: 'Result', value: evaluation ? evaluation.result.toUpperCase() : 'Pending' },
       { label: 'Tab Switches', value: String(submission?.tabSwitchCount ?? 0) }
@@ -999,7 +1023,7 @@ export function buildTrainingRegisterLifecycle(params: {
 
   const attendeeActors = (register.attendees || []).map((a) => ({
     attendee: a,
-    actor: resolveActorInfo(a.employeeId || a.email, users, a.traineeName, a.email)
+    actor: resolveActorInfo(a.userId || a.employeeId || a.email, users, a.traineeName, a.email)
   }));
   const qaRecipients = resolveQaRecipients(users, templateConfig);
   const itRecipients = resolveItRecipients(users, templateConfig);
@@ -1027,8 +1051,10 @@ export function buildTrainingRegisterLifecycle(params: {
   events.push({
     id: createLog?.id || `reg-init-${entityId}`,
     stage: 'Initiation',
+    when: createLog?.when || inferDefaultAuditWhen(createLog?.action || 'Created Training Register', 'Training Registers', createLog?.details),
     timestamp: initiatedAt,
     action: createLog?.action || 'Training Register Initiated',
+    why: createLog?.why || inferAuditReason(createLog?.action || 'Created Training Register', 'Training Registers', createLog?.details),
     actor: initiatorActor,
     initiatedBy: initiatorActor,
     involvedParties: dedupeParticipants([
@@ -1043,7 +1069,7 @@ export function buildTrainingRegisterLifecycle(params: {
       ? [`Attendee #1: ${formatActorInline(firstAttendee.actor)} (Email & In-App Invitation)`]
       : normalizeStringList(createLog?.details?.notifiedRecipients),
     nextAfterFinish: launchedImmediately && firstAttendee
-      ? `Attendee #1: ${formatActorInline(firstAttendee.actor)} — Review SOP document & provide digital signature`
+      ? `Attendee #1: ${formatActorInline(firstAttendee.actor)} — Open register, review SOP document & provide digital signature`
       : `${initiatorActor.name} — Launch Signing Workflow to invite Attendee #1`,
     entityType: 'training_register',
     entityId,
@@ -1058,7 +1084,7 @@ export function buildTrainingRegisterLifecycle(params: {
       timeWindow: `${register.startTime} - ${register.endTime}`,
       modeOfTraining: register.modeOfTraining,
       designatedTrainer: formatActorInline(trainerActor),
-      sopDocument: `${register.documentTitle || register.trainingTitle} (${register.documentCode || register.templateDocCode} ${register.documentVersion || register.templateVersion})`,
+      sopDocument: `${register.documentTitle || register.trainingTitle} (${[register.documentCode || register.templateDocCode, formatQuestionnaireVersion(register.documentVersion || register.templateVersion)].filter(Boolean).join(' ')})`,
       mandatoryDocumentReview: register.requireDocumentReview !== false,
       totalAttendees: register.attendees?.length || 0,
       assessmentConducted: register.assessmentConducted
@@ -1072,8 +1098,10 @@ export function buildTrainingRegisterLifecycle(params: {
     events.push({
       id: startWorkflowLog.id,
       stage: 'In Progress',
+      when: startWorkflowLog.when || inferDefaultAuditWhen(startWorkflowLog.action, 'Training Registers', startWorkflowLog.details),
       timestamp: startWorkflowLog.timestamp,
       action: startWorkflowLog.action,
+      why: startWorkflowLog.why || inferAuditReason(startWorkflowLog.action, 'Training Registers', startWorkflowLog.details),
       actor: startActor,
       initiatedBy: initiatorActor,
       involvedParties: dedupeParticipants([
@@ -1085,7 +1113,7 @@ export function buildTrainingRegisterLifecycle(params: {
         ? [`Attendee #1: ${formatActorInline(firstAttendee.actor)} (Email & In-App Invitation)`]
         : [],
       nextAfterFinish: firstAttendee
-        ? `Attendee #1: ${formatActorInline(firstAttendee.actor)} — Confirm SOP document review & digitally sign`
+        ? `Attendee #1: ${formatActorInline(firstAttendee.actor)} — Open register, confirm SOP document review & digitally sign`
         : 'Attendees — Begin signing sequence',
       entityType: 'training_register',
       entityId,
@@ -1099,8 +1127,10 @@ export function buildTrainingRegisterLifecycle(params: {
     events.push({
       id: `reg-workflow-${entityId}`,
       stage: 'In Progress',
+      when: inferDefaultAuditWhen('Started Signing Workflow', 'Training Registers'),
       timestamp: initiatedAt,
       action: 'Signing Workflow Initiated',
+      why: inferAuditReason('Started Signing Workflow', 'Training Registers'),
       actor: initiatorActor,
       initiatedBy: initiatorActor,
       involvedParties: dedupeParticipants([
@@ -1111,7 +1141,7 @@ export function buildTrainingRegisterLifecycle(params: {
         ? [`Attendee #1: ${formatActorInline(firstAttendee.actor)} (Email & In-App Invitation)`]
         : [],
       nextAfterFinish: firstAttendee
-        ? `Attendee #1: ${formatActorInline(firstAttendee.actor)} — Confirm SOP document review & digitally sign`
+        ? `Attendee #1: ${formatActorInline(firstAttendee.actor)} — Open register, confirm SOP document review & digitally sign`
         : 'Attendees — Begin signing sequence',
       entityType: 'training_register',
       entityId,
@@ -1125,6 +1155,71 @@ export function buildTrainingRegisterLifecycle(params: {
     });
   }
 
+  // 2b. Track Registered Open Access Proofs from register.openedBy + audit logs
+  const openedAuditLogs = matchedLogs.filter((l) => l.action.toLowerCase().includes('opened training register'));
+  for (const openLog of openedAuditLogs) {
+    consumedLogIds.add(openLog.id);
+    const openActor = resolveActorInfo(openLog.userId, users, undefined, openLog.userEmail);
+    events.push({
+      id: openLog.id,
+      stage: 'In Progress',
+      when: openLog.when || inferDefaultAuditWhen(openLog.action, 'Training Registers', openLog.details),
+      timestamp: openLog.timestamp,
+      action: openLog.action,
+      why: openLog.why || inferAuditReason(openLog.action, 'Training Registers', openLog.details),
+      actor: openActor,
+      initiatedBy: initiatorActor,
+      involvedParties: dedupeParticipants([
+        { ...openActor, roleInActivity: `${openLog.details?.role || 'Participant'} (Opened Register)` },
+        { ...trainerActor, roleInActivity: 'Designated Trainer' }
+      ]),
+      notifiedOnFinish: [],
+      nextAfterFinish: `${formatActorInline(openActor)} — Review SOP material and proceed to signature`,
+      entityType: 'training_register',
+      entityId,
+      entityTitle,
+      source: 'audit_log',
+      summary: `${openActor.name} opened and inspected the Training Register on screen.`,
+      details: openLog.details || {}
+    });
+  }
+  for (const openRec of register.openedBy || []) {
+    const hasLogAlready = openedAuditLogs.some(
+      (l) =>
+        (openRec.uid && l.userId === openRec.uid) ||
+        (openRec.email && l.userEmail?.toLowerCase().trim() === openRec.email.toLowerCase().trim())
+    );
+    if (!hasLogAlready) {
+      const openActor = resolveActorInfo(openRec.uid || openRec.email, users, openRec.name, openRec.email);
+      const roleLabel = openRec.role === 'trainer' ? 'Trainer' : openRec.role === 'trainee' ? 'Attendee' : 'Manager';
+      events.push({
+        id: `reg-open-${entityId}-${openRec.uid || openRec.email}`,
+        stage: 'In Progress',
+        when: inferDefaultAuditWhen('Opened Training Register', 'Training Registers'),
+        timestamp: openRec.openedAt,
+        action: 'Opened Training Register',
+        why: inferAuditReason('Opened Training Register', 'Training Registers'),
+        actor: openActor,
+        initiatedBy: initiatorActor,
+        involvedParties: dedupeParticipants([
+          { ...openActor, roleInActivity: `${roleLabel} (Opened Register)` },
+          { ...trainerActor, roleInActivity: 'Designated Trainer' }
+        ]),
+        notifiedOnFinish: [],
+        nextAfterFinish: `${formatActorInline(openActor)} — Complete document review and sign register`,
+        entityType: 'training_register',
+        entityId,
+        entityTitle,
+        source: 'record_state',
+        summary: `${openActor.name} opened the Training Register prior to signing.`,
+        details: {
+          role: roleLabel,
+          openedAt: openRec.openedAt
+        }
+      });
+    }
+  }
+
   // 3. Attendee Document Reviews & Signatures
   for (let i = 0; i < attendeeActors.length; i++) {
     const { attendee, actor: attendeeActor } = attendeeActors[i];
@@ -1135,6 +1230,7 @@ export function buildTrainingRegisterLifecycle(params: {
       (l) =>
         l.action.toLowerCase().includes('confirmed document review') &&
         ((attendee.email && l.userEmail?.toLowerCase().trim() === attendee.email.toLowerCase().trim()) ||
+          (attendee.userId && l.userId === attendee.userId) ||
           (attendee.employeeId && l.userId === attendee.employeeId))
     );
 
@@ -1143,8 +1239,10 @@ export function buildTrainingRegisterLifecycle(params: {
       events.push({
         id: docReviewLog?.id || `doc-review-${entityId}-${attendee.slNo}`,
         stage: 'Review / Signature',
+        when: docReviewLog?.when || inferDefaultAuditWhen('Confirmed Document Review', 'Training Registers', docReviewLog?.details),
         timestamp: attendee.documentReviewedAt || docReviewLog?.timestamp || '',
         action: `Attendee #${attendee.slNo} Confirmed Document Review`,
+        why: docReviewLog?.why || inferAuditReason('Confirmed Document Review', 'Training Registers', docReviewLog?.details),
         actor: attendeeActor,
         initiatedBy: initiatorActor,
         involvedParties: dedupeParticipants([
@@ -1164,7 +1262,9 @@ export function buildTrainingRegisterLifecycle(params: {
           employeeId: attendeeActor.employeeId || attendee.employeeId || 'N/A',
           documentTitle: register.documentTitle || register.trainingTitle,
           documentCode: register.documentCode || register.templateDocCode,
-          documentVersion: register.documentVersion || register.templateVersion
+          ...(formatQuestionnaireVersion(register.documentVersion || register.templateVersion)
+            ? { documentVersion: formatQuestionnaireVersion(register.documentVersion || register.templateVersion) }
+            : {})
         }
       });
     }
@@ -1175,6 +1275,7 @@ export function buildTrainingRegisterLifecycle(params: {
         l.action.toLowerCase().includes('signed training register') &&
         (l.details?.slNo === attendee.slNo ||
           l.details?.attendee === attendee.traineeName ||
+          (attendee.userId && l.userId === attendee.userId) ||
           (attendee.email && l.userEmail?.toLowerCase().trim() === attendee.email.toLowerCase().trim()))
     );
 
@@ -1193,8 +1294,10 @@ export function buildTrainingRegisterLifecycle(params: {
       events.push({
         id: signLog?.id || `sign-${entityId}-${attendee.slNo}`,
         stage: 'Review / Signature',
+        when: signLog?.when || inferDefaultAuditWhen('Signed Training Register', 'Training Registers', signLog?.details),
         timestamp: attendee.signedAt || signLog?.timestamp || register.updatedAt,
         action: `Attendee #${attendee.slNo} Signed Register`,
+        why: signLog?.why || inferAuditReason('Signed Training Register', 'Training Registers', signLog?.details),
         actor: attendeeActor,
         initiatedBy: initiatorActor,
         involvedParties: dedupeParticipants([
@@ -1240,8 +1343,10 @@ export function buildTrainingRegisterLifecycle(params: {
     events.push({
       id: trainerDocLog?.id || `trainer-doc-${entityId}`,
       stage: 'Review / Signature',
+      when: trainerDocLog?.when || inferDefaultAuditWhen('Confirmed Document Review', 'Training Registers', trainerDocLog?.details),
       timestamp: register.trainerDocumentReviewedAt || trainerDocLog?.timestamp || '',
       action: 'Trainer Confirmed Document Review',
+      why: trainerDocLog?.why || inferAuditReason('Confirmed Document Review', 'Training Registers', trainerDocLog?.details),
       actor: trainerActor,
       initiatedBy: initiatorActor,
       involvedParties: dedupeParticipants([
@@ -1258,7 +1363,9 @@ export function buildTrainingRegisterLifecycle(params: {
       details: {
         role: 'Trainer',
         documentTitle: register.documentTitle || register.trainingTitle,
-        documentVersion: register.documentVersion || register.templateVersion
+        ...(formatQuestionnaireVersion(register.documentVersion || register.templateVersion)
+          ? { documentVersion: formatQuestionnaireVersion(register.documentVersion || register.templateVersion) }
+          : {})
       }
     });
   }
@@ -1288,8 +1395,10 @@ export function buildTrainingRegisterLifecycle(params: {
     events.push({
       id: trainerCompleteLog?.id || `trainer-close-${entityId}`,
       stage: 'Closing',
+      when: trainerCompleteLog?.when || inferDefaultAuditWhen('Completed Training Register', 'Training Registers', trainerCompleteLog?.details),
       timestamp: closedAt,
       action: trainerCompleteLog?.action || 'Completed Training Register (Trainer Sign-off & Closure)',
+      why: trainerCompleteLog?.why || inferAuditReason('Completed Training Register', 'Training Registers', trainerCompleteLog?.details),
       actor: trainerActor,
       initiatedBy: initiatorActor,
       involvedParties: allInvolved,
@@ -1323,8 +1432,10 @@ export function buildTrainingRegisterLifecycle(params: {
     events.push({
       id: log.id,
       stage: enriched.stage,
+      when: enriched.when,
       timestamp: log.timestamp,
       action: log.action,
+      why: enriched.why,
       actor: enriched.actor,
       initiatedBy: enriched.initiatedBy || initiatorActor,
       involvedParties: enriched.involvedParties,
@@ -1385,3 +1496,198 @@ export function buildTrainingRegisterLifecycle(params: {
     events: sortEventsAsc(events)
   };
 }
+
+export function buildTemplateLifecycle(params: {
+  template: Template;
+  users: User[];
+  logs: AuditLog[];
+}): LifecycleReportSummary {
+  const { template, users, logs } = params;
+  const entityId = template.id;
+  const ver = formatQuestionnaireVersion(template.version);
+  const entityTitle = `${template.name || 'Questionnaire Template'}${ver ? ` (${ver})` : ''}`;
+
+  const matchedLogs = logs.filter(
+    (l) =>
+      l.entityId === entityId ||
+      l.details?.templateId === entityId ||
+      l.details?.id === entityId
+  );
+
+  const createLog = matchedLogs.find((l) => l.action.toLowerCase().includes('create'));
+  const initiatorActor = resolveActorInfo(
+    template.createdBy || createLog?.userId,
+    users,
+    createLog?.details?.initiatedByName,
+    createLog?.userEmail
+  );
+
+  const events: LifecycleTimelineEvent[] = [];
+  const consumed = new Set<string>();
+
+  if (createLog) {
+    consumed.add(createLog.id);
+    events.push({
+      id: createLog.id,
+      stage: 'Initiation',
+      when: createLog.when || inferDefaultAuditWhen(createLog.action, 'Templates', createLog.details),
+      timestamp: createLog.timestamp || template.createdAt,
+      action: createLog.action,
+      why: createLog.why || inferAuditReason(createLog.action, 'Templates', createLog.details),
+      actor: resolveActorInfo(createLog.userId, users, undefined, createLog.userEmail),
+      initiatedBy: initiatorActor,
+      involvedParties: [{ ...initiatorActor, roleInActivity: 'Template Author' }],
+      notifiedOnFinish: [],
+      nextAfterFinish: 'Ready for assessment assignment & version control',
+      entityType: 'template',
+      entityId,
+      entityTitle,
+      source: 'audit_log',
+      summary: `Created questionnaire template "${template.name}"${ver ? ` (${ver})` : ''}.`,
+      changes: createLog.changes,
+      details: createLog.details || {}
+    });
+  } else {
+    events.push({
+      id: `tmpl-init-${entityId}`,
+      stage: 'Initiation',
+      when: inferDefaultAuditWhen('Created Questionnaire Template', 'Templates'),
+      timestamp: template.createdAt || template.updatedAt,
+      action: 'Created Questionnaire Template',
+      why: inferAuditReason('Created Questionnaire Template', 'Templates'),
+      actor: initiatorActor,
+      initiatedBy: initiatorActor,
+      involvedParties: [{ ...initiatorActor, roleInActivity: 'Template Author' }],
+      notifiedOnFinish: [],
+      nextAfterFinish: 'Ready for assessment assignment & version control',
+      entityType: 'template',
+      entityId,
+      entityTitle,
+      source: 'record_state',
+      summary: `Created questionnaire template "${template.name}"${ver ? ` (${ver})` : ''}.`,
+      details: {
+        documentCode: template.documentCode || 'N/A',
+        ...(ver ? { version: ver } : {}),
+        questionCount: template.questions?.length || 0,
+        status: template.status
+      }
+    });
+  }
+
+  for (const log of matchedLogs) {
+    if (consumed.has(log.id)) continue;
+    const enriched = enrichAuditLogEntry(log, users, { templates: [template] });
+    events.push({
+      id: log.id,
+      stage: enriched.stage,
+      when: enriched.when,
+      timestamp: log.timestamp,
+      action: log.action,
+      why: enriched.why,
+      actor: enriched.actor,
+      initiatedBy: enriched.initiatedBy || initiatorActor,
+      involvedParties: enriched.involvedParties,
+      notifiedOnFinish: enriched.notifiedOnFinish,
+      nextAfterFinish: enriched.nextAfterFinish || 'Template record updated',
+      entityType: 'template',
+      entityId,
+      entityTitle,
+      source: 'audit_log',
+      summary: `${log.action} performed by ${enriched.actor.name}${enriched.actor.email ? ` (${enriched.actor.email})` : ''}.`,
+      changes: log.changes,
+      details: log.details || {}
+    });
+  }
+
+  const sortedEvents = sortEventsAsc(events);
+  const latestEvent = sortedEvents[sortedEvents.length - 1];
+  const allParties = dedupeParticipants(sortedEvents.flatMap((e) => e.involvedParties));
+
+  return {
+    entityType: 'template',
+    entityId,
+    entityTitle,
+    currentStatus: (template.status || 'active').toUpperCase(),
+    isClosed: template.status === 'inactive',
+    initiatedBy: { ...initiatorActor, timestamp: template.createdAt || sortedEvents[0]?.timestamp },
+    closedBy: latestEvent ? { ...latestEvent.actor, timestamp: latestEvent.timestamp } : null,
+    allInvolvedParties: allParties,
+    notificationsSummary: [],
+    nextStepSummary:
+      template.status === 'active'
+        ? 'Active template — available for assessment assignments and training evaluations.'
+        : `Template status: ${template.status}`,
+    metrics: [
+      { label: 'Template Code', value: template.documentCode || 'N/A' },
+      { label: 'Version', value: ver || '—' },
+      { label: 'Questions', value: String(template.questions?.length || 0) },
+      { label: 'Pass Mark', value: `${template.passMark ?? 80}%` }
+    ],
+    events: sortedEvents
+  };
+}
+
+export function buildGenericEntityLifecycle(params: {
+  entityType: AuditEntityCategory;
+  entityId: string;
+  entityTitle?: string;
+  logs: AuditLog[];
+  users: User[];
+  context?: AuditEnrichmentContext;
+}): LifecycleReportSummary {
+  const { entityType, entityId, entityTitle, logs, users, context } = params;
+  const matched = logs.filter(
+    (l) =>
+      l.entityId === entityId ||
+      l.details?.id === entityId ||
+      l.details?.submissionId === entityId ||
+      l.details?.assignmentId === entityId ||
+      l.details?.registerId === entityId ||
+      l.details?.templateId === entityId
+  );
+
+  const enrichedEvents: LifecycleTimelineEvent[] = sortEventsAsc(
+    matched.map((log) => {
+      const enriched = enrichAuditLogEntry(log, users, context);
+      return {
+        id: log.id,
+        stage: enriched.stage,
+        when: enriched.when,
+        timestamp: log.timestamp,
+        action: log.action,
+        why: enriched.why,
+        actor: enriched.actor,
+        initiatedBy: enriched.initiatedBy,
+        involvedParties: enriched.involvedParties,
+        notifiedOnFinish: enriched.notifiedOnFinish,
+        nextAfterFinish: enriched.nextAfterFinish || 'Audit event recorded',
+        entityType: enriched.resolvedEntityType,
+        entityId,
+        entityTitle: entityTitle || log.entityTitle || entityId,
+        source: 'audit_log',
+        summary: `${log.action} performed by ${enriched.actor.name}${enriched.actor.email ? ` (${enriched.actor.email})` : ''}.`,
+        changes: log.changes,
+        details: log.details || {}
+      };
+    })
+  );
+
+  const first = enrichedEvents[0];
+  const last = enrichedEvents[enrichedEvents.length - 1];
+  const initiator = first?.initiatedBy || first?.actor || { name: 'System', email: '' };
+
+  return {
+    entityType,
+    entityId,
+    entityTitle: entityTitle || first?.entityTitle || entityId,
+    currentStatus: `${enrichedEvents.length} Recorded Activit${enrichedEvents.length === 1 ? 'y' : 'ies'}`,
+    isClosed: Boolean(last && last.stage === 'Closing'),
+    initiatedBy: { ...initiator, timestamp: first?.timestamp },
+    closedBy: last ? { ...last.actor, timestamp: last.timestamp } : null,
+    allInvolvedParties: dedupeParticipants(enrichedEvents.flatMap((e) => e.involvedParties)),
+    notificationsSummary: last?.notifiedOnFinish || [],
+    nextStepSummary: last?.nextAfterFinish || 'All logged activities displayed.',
+    events: enrichedEvents
+  };
+}
+

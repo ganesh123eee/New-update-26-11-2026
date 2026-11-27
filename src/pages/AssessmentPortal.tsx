@@ -17,7 +17,7 @@ import {
 } from 'lucide-react';
 import { firestoreService, where, limit } from '../services/firestoreService';
 import { Assignment, Template, Submission, Question, User, Department } from '../types';
-import { cn, formatDateTime, formatId } from '../lib/utils';
+import { cn, formatDateTime, formatId, formatQuestionnaireVersion } from '../lib/utils';
 import { useAuth } from '../contexts/AuthContext';
 import { BrandLogo } from '../components/BrandLogo';
 import { sanitizeReportBrandName } from '../utils/pdfBranding';
@@ -350,7 +350,7 @@ export default function AssessmentPortal() {
             assignmentId,
             templateId: template.id,
             templateName: template.name,
-            templateVersion: template.version || 'V1.0',
+            templateVersion: formatQuestionnaireVersion(template.version) || undefined,
             employeeId: user.uid,
             reviewerId: assignment.reviewerId,
             initiatedByUid: assignment.assignedBy,
@@ -370,7 +370,8 @@ export default function AssessmentPortal() {
           {
             entityType: 'assessment_report',
             entityId: id,
-            entityTitle: `${template.name} — ${user.displayName}`
+            entityTitle: `${template.name} — ${user.displayName}`,
+            why: 'To begin the assigned competency assessment attempt within the allowed schedule.'
           }
         ).catch(console.error);
       }
@@ -489,7 +490,7 @@ export default function AssessmentPortal() {
               submissionId,
               assignmentId, 
               templateName: template?.name,
-              templateVersion: template?.version || 'V1.0',
+              templateVersion: formatQuestionnaireVersion(template?.version) || undefined,
               employeeId: user?.uid,
               reviewerId: assignment?.reviewerId,
               tabSwitchCount,
@@ -528,7 +529,10 @@ export default function AssessmentPortal() {
             {
               entityType: 'assessment_report',
               entityId: submissionId,
-              entityTitle: `${template?.name || 'Assessment'} — ${user?.displayName || user?.email}`
+              entityTitle: `${template?.name || 'Assessment'} — ${user?.displayName || user?.email}`,
+              why: isAutoSubmit
+                ? 'Assessment automatically submitted upon timer expiry to preserve completed answers for evaluation.'
+                : 'Candidate submitted completed assessment responses for grading and Assessor sign-off.'
             }
           ).catch(console.error);
 
@@ -548,6 +552,7 @@ export default function AssessmentPortal() {
             }
             if (reviewer?.email) {
               const reviewLink = `${window.location.origin}/evaluate/${submissionId}`;
+              const verText = formatQuestionnaireVersion(template?.version);
               const emailData = {
                 to: reviewer.email,
                 subject: `Assessment Completed: ${template?.name} - Evaluation Required`,
@@ -559,7 +564,7 @@ export default function AssessmentPortal() {
                     </div>
                     <h2 style="color: #0f172a; border-bottom: 1px solid #e2e8f0; padding-bottom: 10px;">Assessment Completed</h2>
                     <p>Hello <strong>${reviewer.displayName}</strong>,</p>
-                    <p>An employee has completed the assessment <strong>${template?.name}</strong> (${template?.version || 'V1.0'}).</p>
+                    <p>An employee has completed the assessment <strong>${template?.name}</strong>${verText ? ` (${verText})` : ''}.</p>
                     <div style="background-color: #f8fafc; padding: 20px; border-radius: 12px; margin: 25px 0; border: 1px solid #f1f5f9;">
                       <p style="margin: 0; color: #475569;"><strong>Employee:</strong> ${user?.displayName || user?.email}</p>
                       <p style="margin: 10px 0 0 0; color: #475569;"><strong>Submitted At:</strong> ${formatDateTime(new Date())}</p>
@@ -741,9 +746,11 @@ export default function AssessmentPortal() {
             <div className="min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
                 <h1 className="text-xl sm:text-3xl font-bold truncate">{template?.name}</h1>
-                <span className="px-2 py-0.5 bg-primary/10 text-primary rounded-md text-xs font-mono font-bold shrink-0">
-                  {template?.version || 'V1.0'}
-                </span>
+                {formatQuestionnaireVersion(template?.version) && (
+                  <span className="px-2 py-0.5 bg-primary/10 text-primary rounded-md text-xs font-mono font-bold shrink-0">
+                    {formatQuestionnaireVersion(template?.version)}
+                  </span>
+                )}
               </div>
               <p className="text-xs sm:text-sm text-muted-foreground">{template?.skillCategory} Assessment</p>
             </div>

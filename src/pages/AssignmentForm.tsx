@@ -20,7 +20,7 @@ import {
 } from 'lucide-react';
 import { firestoreService } from '../services/firestoreService';
 import { Template, User, Department, Assignment } from '../types';
-import { cn } from '../lib/utils';
+import { cn, formatQuestionnaireVersion } from '../lib/utils';
 import { useAuth } from '../contexts/AuthContext';
 import { sanitizeReportBrandName } from '../utils/pdfBranding';
 
@@ -151,10 +151,11 @@ export default function AssignmentForm() {
         for (const recipient of recipients) {
           // Create in-app notification for assigned employee
           for (const item of createdAssignments) {
+            const verLabel = formatQuestionnaireVersion(item.template?.version);
             await firestoreService.createDocument('notifications', {
               userId: recipient.uid,
               title: 'New Assessment Assigned',
-              message: `You have been assigned "${item.template?.name || 'Assessment'}" (${item.template?.version || 'V1.0'}). Due date: ${formData.dueDate}.`,
+              message: `You have been assigned "${item.template?.name || 'Assessment'}"${verLabel ? ` (${verLabel})` : ''}. Due date: ${formData.dueDate}.`,
               type: 'info',
               read: false,
               link: `/portal/${item.id}`
@@ -169,9 +170,10 @@ export default function AssignmentForm() {
           
           const assessmentListHtml = createdAssignments.map(item => {
             const assessmentLink = `${window.location.origin}/portal/${item.id}`;
+            const verLabel = formatQuestionnaireVersion(item.template?.version);
             return `
               <div style="background-color: #f8fafc; padding: 15px; border-radius: 10px; margin-bottom: 15px; border: 1px solid #f1f5f9;">
-                <p style="margin: 0; color: #0f172a; font-weight: bold;">${item.template?.name} <span style="font-size: 12px; color: #2563eb;">(${item.template?.version || 'V1.0'})</span></p>
+                <p style="margin: 0; color: #0f172a; font-weight: bold;">${item.template?.name}${verLabel ? ` <span style="font-size: 12px; color: #2563eb;">(${verLabel})</span>` : ''}</p>
                 <p style="margin: 5px 0; color: #64748b; font-size: 13px;">Duration: ${item.template?.duration || 30} minutes</p>
                 <div style="margin-top: 10px;">
                   <a href="${assessmentLink}" style="display: inline-block; background-color: #2563eb; color: white; padding: 8px 16px; text-decoration: none; border-radius: 6px; font-weight: bold; font-size: 14px;">Start Assessment</a>
@@ -298,7 +300,8 @@ export default function AssignmentForm() {
         {
           entityType: 'assignment',
           entityId: createdAssignments[0]?.id,
-          entityTitle: templateTitles
+          entityTitle: templateTitles,
+          why: `To assign competency assessment(s) due on ${formData.dueDate} to designated personnel and assign Assessor ${assignedReviewer?.displayName || ''}.`
         }
       );
 
@@ -400,9 +403,11 @@ export default function AssignmentForm() {
                                       <div className="flex flex-col">
                                         <div className="flex items-center gap-2 flex-wrap">
                                           <span className="text-sm font-medium">{t.name}</span>
-                                          <span className="px-1.5 py-0.5 bg-primary/10 text-primary border border-primary/20 rounded text-[10px] font-mono font-bold">
-                                            {t.version || 'V1.0'}
-                                          </span>
+                                          {formatQuestionnaireVersion(t.version) && (
+                                            <span className="px-1.5 py-0.5 bg-primary/10 text-primary border border-primary/20 rounded text-[10px] font-mono font-bold">
+                                              {formatQuestionnaireVersion(t.version)}
+                                            </span>
+                                          )}
                                           {t.documentCode && (
                                             <span className="text-[10px] font-mono text-muted-foreground">({t.documentCode})</span>
                                           )}
@@ -564,9 +569,11 @@ export default function AssignmentForm() {
                                     <div className="flex flex-col">
                                       <div className="flex items-center gap-2">
                                         <span className="text-sm font-medium">{t.name}</span>
-                                        <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-primary/10 text-primary">
-                                          {t.version || 'V1.0'}
-                                        </span>
+                                        {formatQuestionnaireVersion(t.version) && (
+                                          <span className="text-[10px] font-mono font-bold px-1.5 py-0.5 rounded bg-primary/10 text-primary">
+                                            {formatQuestionnaireVersion(t.version)}
+                                          </span>
+                                        )}
                                       </div>
                                       <span className="text-[10px] text-muted-foreground">{t.skillCategory}</span>
                                     </div>

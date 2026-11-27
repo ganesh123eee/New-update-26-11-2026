@@ -19,7 +19,7 @@ import {
 import { firestoreService } from '../services/firestoreService';
 import { trainingRegisterService } from '../services/trainingRegisterService';
 import { Submission, Template, Evaluation, User, Question, Assignment, Department } from '../types';
-import { cn, formatDateTime, formatId } from '../lib/utils';
+import { cn, formatDateTime, formatId, formatQuestionnaireVersion } from '../lib/utils';
 import { useAuth } from '../contexts/AuthContext';
 import { sanitizeReportBrandName } from '../utils/pdfBranding';
 
@@ -46,8 +46,6 @@ export default function EvaluationForm() {
     questionScores: {},
     questionComments: {},
     overallComments: '',
-    strengths: '',
-    improvements: '',
     result: 'pass',
     retestRequired: false
   });
@@ -129,7 +127,8 @@ export default function EvaluationForm() {
           {
             entityType: 'assessment_report',
             entityId: submissionId,
-            entityTitle: temp?.name || 'Assessment Report'
+            entityTitle: temp?.name || 'Assessment Report',
+            why: 'To review candidate responses and conduct or inspect Assessor evaluation.'
           }
         );
 
@@ -302,7 +301,7 @@ export default function EvaluationForm() {
             assignmentId: assignment?.id,
             employeeName: employee?.displayName,
             templateName: template?.name,
-            templateVersion: template?.version || 'V1.0',
+            templateVersion: formatQuestionnaireVersion(template?.version) || undefined,
             score: finalScore,
             result: evaluation.result,
             retestRequired: Boolean(evaluation.retestRequired),
@@ -326,6 +325,7 @@ export default function EvaluationForm() {
             entityType: 'assessment_report',
             entityId: submissionId,
             entityTitle: `${template?.name || 'Assessment'} — ${employee?.displayName || 'Trainee'}`,
+            why: 'To finalize the Assessor evaluation, determine competency Pass/Fail result, and notify QA, Assessor, and Trainee.',
             changes: [
               { field: 'status', from: submission?.status || 'submitted', to: 'completed' },
               { field: 'finalScore', from: null, to: `${finalScore.toFixed(1)}%` },
@@ -396,7 +396,7 @@ export default function EvaluationForm() {
           <div style="background-color: ${resultBadgeBg}; padding: 18px; border-radius: 12px; margin: 20px 0; border: 1px solid ${resultBadgeBorder};">
             <p style="margin: 0; color: #334155;"><strong>Trainee:</strong> ${employee?.displayName || employee?.email || 'N/A'} ${employee?.employeeId ? `(${employee.employeeId})` : ''}</p>
             <p style="margin: 8px 0 0 0; color: #334155;"><strong>Assessor:</strong> ${assignedReviewerName}</p>
-            <p style="margin: 8px 0 0 0; color: #334155;"><strong>Assessment:</strong> ${template?.name || 'N/A'} (${template?.version || 'V1.0'})</p>
+            <p style="margin: 8px 0 0 0; color: #334155;"><strong>Assessment:</strong> ${template?.name || 'N/A'}${formatQuestionnaireVersion(template?.version) ? ` (${formatQuestionnaireVersion(template?.version)})` : ''}</p>
             <p style="margin: 8px 0 0 0; color: #334155;"><strong>Result:</strong> <span style="color: ${resultColor}; font-weight: bold;">${resultLabel}</span></p>
             <p style="margin: 8px 0 0 0; color: #334155;"><strong>Score:</strong> ${finalScore.toFixed(1)}%</p>
             <p style="margin: 8px 0 0 0; color: #334155;"><strong>Re-assessment Required:</strong> ${evaluation.retestRequired ? 'Yes' : 'No'}</p>
@@ -756,34 +756,6 @@ export default function EvaluationForm() {
                   <p>• Pass (≥80.0%): Re-assessment is automatically disabled.</p>
                   <p>• Fail (&lt;80.0%): Re-assessment is automatically enabled.</p>
                 </div>
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-xs font-bold uppercase text-muted-foreground">Strengths</label>
-                <textarea 
-                  value={evaluation.strengths}
-                  readOnly={isReadOnly}
-                  onChange={e => setEvaluation({...evaluation, strengths: e.target.value})}
-                  className={cn(
-                    "w-full px-3 py-2 bg-background border rounded-lg outline-none focus:ring-2 focus:ring-primary/20 min-h-[80px] text-sm",
-                    isReadOnly && "bg-muted cursor-not-allowed"
-                  )}
-                  placeholder={isReadOnly ? "" : "What did the employee do well?"}
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-xs font-bold uppercase text-muted-foreground">Areas for Improvement</label>
-                <textarea 
-                  value={evaluation.improvements}
-                  readOnly={isReadOnly}
-                  onChange={e => setEvaluation({...evaluation, improvements: e.target.value})}
-                  className={cn(
-                    "w-full px-3 py-2 bg-background border rounded-lg outline-none focus:ring-2 focus:ring-primary/20 min-h-[80px] text-sm",
-                    isReadOnly && "bg-muted cursor-not-allowed"
-                  )}
-                  placeholder={isReadOnly ? "" : "Where can they grow?"}
-                />
               </div>
 
               <div className="space-y-1.5">

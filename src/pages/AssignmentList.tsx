@@ -26,7 +26,7 @@ import { Link, useLocation } from 'react-router-dom';
 import { firestoreService } from '../services/firestoreService';
 import { where } from 'firebase/firestore';
 import { Assignment, Template, User as UserType, Submission, Evaluation, Department } from '../types';
-import { formatDate, formatDateTime, cn, formatId } from '../lib/utils';
+import { formatDate, formatDateTime, cn, formatId, formatQuestionnaireVersion } from '../lib/utils';
 import { toast } from 'sonner';
 import { motion, AnimatePresence } from 'motion/react';
 import { useAuth } from '../contexts/AuthContext';
@@ -229,7 +229,7 @@ export default function AssignmentList() {
         },
         user?.uid,
         user?.email,
-        { entityType: 'assignment', entityId: id, entityTitle: assignment?.template?.name }
+        { entityType: 'assignment', entityId: id, entityTitle: assignment?.template?.name, why: 'To cancel and remove an obsolete assessment assignment and its associated submissions.' }
       );
       setAssignments(prev => prev.filter(a => a.id !== id));
       toast.success(`Assignment and ${submissions.length} related submissions deleted successfully`);
@@ -352,9 +352,11 @@ export default function AssignmentList() {
                       <div>
                         <div className="flex items-center gap-2">
                           <p className="text-sm font-bold">{item.template?.name || 'Unknown Template'}</p>
-                          <span className="px-1.5 py-0.5 rounded bg-primary/10 text-primary text-[10px] font-mono font-bold">
-                            {item.template?.version || 'V1.0'}
-                          </span>
+                          {formatQuestionnaireVersion(item.template?.version) && (
+                            <span className="px-1.5 py-0.5 rounded bg-primary/10 text-primary text-[10px] font-mono font-bold">
+                              {formatQuestionnaireVersion(item.template?.version)}
+                            </span>
+                          )}
                         </div>
                         <div className="flex items-center gap-2">
                           <p className="text-xs text-muted-foreground">{item.template?.skillCategory}</p>
@@ -462,9 +464,11 @@ export default function AssignmentList() {
                   <div>
                     <div className="flex items-center gap-2">
                       <h3 className="text-xl font-bold">{selectedAssignment.template?.name}</h3>
-                      <span className="px-2 py-0.5 rounded bg-primary/10 text-primary text-xs font-mono font-bold">
-                        {selectedAssignment.template?.version || 'V1.0'}
-                      </span>
+                      {formatQuestionnaireVersion(selectedAssignment.template?.version) && (
+                        <span className="px-2 py-0.5 rounded bg-primary/10 text-primary text-xs font-mono font-bold">
+                          {formatQuestionnaireVersion(selectedAssignment.template?.version)}
+                        </span>
+                      )}
                     </div>
                     <p className="text-sm text-muted-foreground">Detailed Assignment Progress & Status</p>
                   </div>

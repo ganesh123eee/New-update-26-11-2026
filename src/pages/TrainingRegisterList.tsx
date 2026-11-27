@@ -13,14 +13,19 @@ import {
   CheckCircle2, 
   AlertCircle,
   FileCheck,
-  BookOpen
+  BookOpen,
+  History,
+  X,
+  Loader2
 } from 'lucide-react';
 import { toast } from 'sonner';
 import { useAuth } from '../contexts/AuthContext';
 import { firestoreService } from '../services/firestoreService';
-import { TrainingRegister } from '../types';
+import { AuditLog, TrainingRegister, TrainingRegisterTemplateConfig, User as UserType } from '../types';
 import { formatDate, cn } from '../lib/utils';
 import { trainingRegisterService } from '../services/trainingRegisterService';
+import { AuditLifecyclePanel } from '../components/AuditLifecyclePanel';
+import { buildTrainingRegisterLifecycle, LifecycleReportSummary } from '../utils/auditLifecycle';
 
 export default function TrainingRegisterList() {
   const { user: currentUser, branding, isAdmin, isHR, isQM, hasPermission } = useAuth();
@@ -31,6 +36,8 @@ export default function TrainingRegisterList() {
   const [registerToDelete, setRegisterToDelete] = useState<TrainingRegister | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [auditModalSummary, setAuditModalSummary] = useState<LifecycleReportSummary | null>(null);
+  const [auditModalLoadingId, setAuditModalLoadingId] = useState<string | null>(null);
 
   const canManageRegisters = Boolean(
     isAdmin ||
@@ -90,7 +97,12 @@ export default function TrainingRegisterList() {
         { id: reg.id, title: reg.trainingTitle },
         currentUser?.uid,
         currentUser?.email,
-        { entityType: 'training_register', entityId: reg.id, entityTitle: reg.trainingTitle }
+        {
+          entityType: 'training_register',
+          entityId: reg.id,
+          entityTitle: reg.trainingTitle,
+          why: 'Delete obsolete or duplicate Training Register record'
+        }
       );
       toast.success('Training Register deleted successfully', { id: toastId });
       setRegisterToDelete(null);
@@ -119,6 +131,30 @@ export default function TrainingRegisterList() {
     }
   };
 
+  const handleOpenAuditTrail = async (register: TrainingRegister) => {
+    if (!register?.id) return;
+    setAuditModalLoadingId(register.id);
+    try {
+      const [allUsers, logs, tmplCfg] = await Promise.all([
+        firestoreService.getCollection<UserType>('users'),
+        firestoreService.getCollection<AuditLog>('auditLogs'),
+        trainingRegisterService.getTemplateConfig().catch(() => null)
+      ]);
+      const summary = buildTrainingRegisterLifecycle({
+        register,
+        users: allUsers,
+        logs,
+        templateConfig: tmplCfg as TrainingRegisterTemplateConfig | null
+      });
+      setAuditModalSummary(summary);
+    } catch (err) {
+      console.error('Failed to load register audit trail:', err);
+      toast.error('Failed to load register audit trail');
+    } finally {
+      setAuditModalLoadingId(null);
+    }
+  };
+
   const visibleRegisters = registers.filter((r) => {
     if (canManageRegisters) return true;
     if (!currentUser) return false;
@@ -130,7 +166,8 @@ export default function TrainingRegisterList() {
       (r.trainerName && uName && r.trainerName.toLowerCase().trim() === uName);
     const isAttendee = (r.attendees || []).some(
       (a) =>
-        (a.employeeId && (a.employeeId === currentUser.uid || a.employeeId === currentUser.employeeId)) ||
+        (a.userId && a.userId === currentUser.uid) ||
+        (a.employeeId && (a.employeeId === currentUser.uid || (currentUser.employeeId && a.employeeId === currentUser.employeeId))) ||
         (a.email && uEmail && a.email.toLowerCase().trim() === uEmail)
     );
     return isTrainer || isAttendee;
@@ -322,15 +359,62 @@ export default function TrainingRegisterList() {
                       {/* Actions */}
                       <td className="py-3.5 px-4 text-right">
                         <div className="flex items-center justify-end gap-2">
-                          {/* View button */}
-                          <Link
-                            to={`/training-registers/${reg.id}`}
-                            className="inline-flex items-center gap-1.5 px-2.5 py-1.5 border rounded-lg hover:bg-accent text-foreground transition-colors text-xs font-semibold shadow-2xs"
-                            title="View / Sign Register"
+                          {/* View / Open & Sign button */}
+                          {(() => {
+                            const uEmail = currentUser?.email?.toLowerCase().trim() || '';
+                            const uName = currentUser?.displayName?.toLowerCase().trim() || '';
+                            const curAtt = (reg.attendees || [])[reg.currentSignerIndex];
+                            const isMyAttendeeTurn =
+                              reg.workflowStatus === 'in_progress' &&
+                              curAtt?.status === 'pending' &&
+                              Boolean(
+                                currentUser && (
+                                  (curAtt.userId && curAtt.userId === currentUser.uid) ||
+                                  (curAtt.employeeId && (curAtt.employeeId === currentUser.uid || (currentUser.employeeId && curAtt.employeeId === currentUser.employeeId))) ||
+                                  (curAtt.email && uEmail && curAtt.email.toLowerCase().trim() === uEmail)
+                                )
+                              );
+                            const isMyTrainerTurn =
+                              reg.workflowStatus === 'awaiting_trainer' &&
+                              Boolean(
+                                currentUser && (
+                                  (reg.trainerId && reg.trainerId === currentUser.uid) ||
+                                  (reg.trainerEmail && uEmail && reg.trainerEmail.toLowerCase().trim() === uEmail) ||
+                                  (reg.trainerName && uName && reg.trainerName.toLowerCase().trim() === uName)
+                                )
+                              );
+                            const needsMySignature = isMyAttendeeTurn || isMyTrainerTurn;
+                            return (
+                              <Link
+                                to={`/training-registers/${reg.id}`}
+                                className={cn(
+                                  'inline-flex items-center gap-1.5 px-2.5 py-1.5 border rounded-lg transition-colors text-xs font-semibold shadow-2xs',
+                                  needsMySignature
+                                    ? 'bg-primary text-primary-foreground border-primary hover:opacity-90'
+                                    : 'hover:bg-accent text-foreground'
+                                )}
+                                title={needsMySignature ? 'Open Register to Review & Sign' : 'View Register'}
+                              >
+                                <Eye className={cn('w-3.5 h-3.5', needsMySignature ? 'text-primary-foreground' : 'text-primary')} />
+                                <span>{needsMySignature ? 'Open & Sign' : 'View'}</span>
+                              </Link>
+                            );
+                          })()}
+
+                          {/* Report-wise Audit Trail Report button */}
+                          <button
+                            type="button"
+                            disabled={auditModalLoadingId === reg.id}
+                            onClick={() => handleOpenAuditTrail(reg)}
+                            className="p-1.5 border rounded-lg hover:bg-sky-50 text-sky-700 border-sky-200 transition-colors disabled:opacity-50"
+                            title="View Final Audit Trail Report"
                           >
-                            <Eye className="w-3.5 h-3.5 text-primary" />
-                            <span>View</span>
-                          </Link>
+                            {auditModalLoadingId === reg.id ? (
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                            ) : (
+                              <History className="w-4 h-4" />
+                            )}
+                          </button>
 
                           {/* Download PDF button - restricted to Admin and Quality team */}
                           {canDownloadRegister && (
@@ -396,6 +480,42 @@ export default function TrainingRegisterList() {
                 className="px-4 py-2 text-sm bg-destructive text-destructive-foreground font-semibold rounded-lg hover:opacity-90 disabled:opacity-50"
               >
                 {isDeleting ? 'Deleting...' : 'Delete'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Report-Wise Final Audit Report Modal */}
+      {auditModalSummary && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4">
+          <div className="bg-card w-full max-w-5xl max-h-[90vh] rounded-2xl border shadow-2xl flex flex-col overflow-hidden">
+            <div className="p-5 border-b flex items-center justify-between bg-muted/20">
+              <div>
+                <h3 className="text-lg font-bold text-foreground">Training Register Audit Trail Report</h3>
+                <p className="text-xs text-muted-foreground">{auditModalSummary.entityTitle}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAuditModalSummary(null)}
+                className="p-2 hover:bg-accent rounded-full transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-5 overflow-y-auto flex-1">
+              <AuditLifecyclePanel
+                summary={auditModalSummary}
+                compact
+                title="Register Final Audit Report (Changes & Activities)"
+              />
+            </div>
+            <div className="p-4 border-t bg-muted/10 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setAuditModalSummary(null)}
+                className="px-5 py-2 border rounded-xl text-xs font-bold hover:bg-accent"
+              >
+                Close
               </button>
             </div>
           </div>

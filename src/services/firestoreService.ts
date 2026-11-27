@@ -124,6 +124,96 @@ export function inferAuditEntityType(logOrParams: {
   return 'system';
 }
 
+export function inferAuditReason(action: string, module: string, details: any = {}): string {
+  if (details?.why && typeof details.why === 'string' && details.why.trim()) {
+    return details.why.trim();
+  }
+  if (details?.reason && typeof details.reason === 'string' && details.reason.trim()) {
+    return details.reason.trim();
+  }
+  const act = String(action || '').toLowerCase();
+  const mod = String(module || '').toLowerCase();
+
+  if (act.includes('login')) return 'To authenticate into the portal and start an authorized user session.';
+  if (act.includes('logout')) return 'To securely end the active user session.';
+  if (act.includes('opened training register')) {
+    return 'Mandatory pre-signature inspection: register opened on screen so the signer reviews training details and reference SOP before signing.';
+  }
+  if (act.includes('document reviewed')) {
+    return 'Mandatory compliance step before digital sign-off to verify the training document was read and understood.';
+  }
+  if (act.includes('attendee signed')) {
+    return 'Sequential trainee sign-off confirming attendance and understanding of the training session.';
+  }
+  if (act.includes('trainer signed')) {
+    return 'Final trainer verification confirming all trainees attended and completed the training register.';
+  }
+  if (act.includes('created training register') || act.includes('updated training register')) {
+    return details?.workflowStatus === 'in_progress' || act.includes('workflow')
+      ? 'To establish the training record and initiate the sequential digital signature workflow.'
+      : 'To create or update the training register details prior to initiating sign-off.';
+  }
+  if (act.includes('deleted training register')) {
+    return 'To remove an obsolete or erroneous training register record.';
+  }
+  if (act.includes('evaluation') || mod.includes('evaluation') || mod.includes('review')) {
+    return 'To grade submitted answers, determine pass/fail competency result, and notify stakeholders.';
+  }
+  if (act.includes('submitted assessment') || act.includes('submit')) {
+    return 'To submit completed assessment responses for grading and quality review.';
+  }
+  if (act.includes('started assessment') || act.includes('start')) {
+    return 'To begin the assigned competency assessment attempt.';
+  }
+  if (act.includes('auto-save') || act.includes('saved progress')) {
+    return 'To preserve in-progress assessment responses against accidental interruption.';
+  }
+  if (act.includes('assignment') || act.includes('assigned')) {
+    return 'To assign a competency assessment to target personnel with a designated assessor and schedule.';
+  }
+  if (act.includes('template')) {
+    return 'To maintain standardized questionnaire or training register specifications and version control.';
+  }
+  if (act.includes('branding')) {
+    return 'To configure environment-specific organization branding and report headers.';
+  }
+  if (act.includes('user') || mod.includes('user')) {
+    return 'To administer user accounts, roles, and access permissions.';
+  }
+  if (act.includes('role') || mod.includes('role')) {
+    return 'To configure role-based access control permissions.';
+  }
+  if (act.includes('department')) {
+    return 'To maintain organizational department structures.';
+  }
+  if (act.includes('export') || act.includes('download') || mod.includes('report')) {
+    return 'To generate and inspect compliance reports or audit documentation.';
+  }
+  return `To record ${action || 'this activity'} within the ${module || 'system'} module for compliance traceability.`;
+}
+
+export function inferAuditStage(action: string, module: string, details: any = {}): string {
+  if (details?.when && typeof details.when === 'string' && details.when.trim()) {
+    return details.when.trim();
+  }
+  const act = String(action || '').toLowerCase();
+  const mod = String(module || '').toLowerCase();
+
+  if (act.includes('login') || act.includes('logout')) return 'Session Authentication';
+  if (act.includes('created') || act.includes('assigned')) return 'Initiation / Setup';
+  if (act.includes('opened')) return 'Pre-Signature Access Verification';
+  if (act.includes('document reviewed')) return 'Mandatory Document Review';
+  if (act.includes('attendee signed')) return 'Sequential Trainee Sign-off';
+  if (act.includes('trainer signed')) return 'Final Trainer Sign-off & Closure';
+  if (act.includes('started')) return 'Assessment Attempt Started';
+  if (act.includes('submitted')) return 'Candidate Submission';
+  if (act.includes('evaluation') || act.includes('completed')) return 'Assessor Evaluation & Result Closure';
+  if (act.includes('updated') || act.includes('edited')) return 'Record Modification';
+  if (act.includes('deleted')) return 'Record Removal';
+  if (mod.includes('report')) return 'Reporting & Audit Export';
+  return `${module || 'System'} Execution`;
+}
+
 export const firestoreService = {
   resolveDocRef(path: string, id: string) {
     if (path === 'settings') {
@@ -248,11 +338,14 @@ export const firestoreService = {
       entityId?: string;
       entityTitle?: string;
       changes?: Array<{ field: string; from?: any; to?: any }>;
+      why?: string;
+      when?: string;
     }
   ) {
     try {
       const finalUserId = userId || auth.currentUser?.uid || 'system';
       const finalUserEmail = userEmail || auth.currentUser?.email || 'system@symetricsystems.com';
+      const nowIso = new Date().toISOString();
 
       const inferredEntityId =
         meta?.entityId ||
@@ -278,12 +371,17 @@ export const firestoreService = {
         details?.name ||
         details?.reportType;
 
+      const finalWhy = (meta?.why && meta.why.trim()) || inferAuditReason(action, module, details);
+      const finalWhen = (meta?.when && meta.when.trim()) || inferAuditStage(action, module, details);
+
       const payload: Record<string, any> = {
         userId: finalUserId,
         userEmail: finalUserEmail,
         action,
         module,
-        timestamp: new Date().toISOString(),
+        timestamp: nowIso,
+        when: finalWhen,
+        why: finalWhy,
         details
       };
 
@@ -447,7 +545,7 @@ export const firestoreService = {
       if (!brandingSnap.exists()) {
         let initialBranding = {
           appName: 'AssessPro',
-          companyName: 'Symetric Systems',
+          companyName: 'SyMetric Systems',
           logoUrl: '/logo.svg',
           primaryColor: '#0f172a',
           updatedAt: new Date().toISOString()

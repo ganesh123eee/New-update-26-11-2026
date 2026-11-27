@@ -4,6 +4,7 @@ import { doc, collection, query, where, getDocs, getDoc, setDoc, onSnapshot } fr
 import { User, RoleDefinition, Permission } from '../types';
 import { firestoreService } from '../services/firestoreService';
 import { environmentService } from '../services/environmentService';
+import { normalizeSyMetricText } from '../lib/utils';
 
 export interface LogoPlacementConfig {
   applyToNav: boolean;     // Main application sidebar / navigation header
@@ -47,7 +48,7 @@ const getInitialBranding = (): BrandingInfo => {
       if (parsed && typeof parsed === 'object') {
         return {
           appName: parsed.appName || 'AssessPro',
-          companyName: parsed.companyName || '',
+          companyName: normalizeSyMetricText(parsed.companyName || ''),
           logoUrl: parsed.logoUrl !== undefined ? parsed.logoUrl : '/logo.svg',
           primaryColor: parsed.primaryColor || '#0f172a',
           restrictAcrossApp: parsed.restrictAcrossApp !== undefined ? Boolean(parsed.restrictAcrossApp) : true,
@@ -92,7 +93,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const data = snap.data();
         const updated: BrandingInfo = {
           appName: data.appName || 'AssessPro',
-          companyName: data.companyName || '',
+          companyName: normalizeSyMetricText(data.companyName || ''),
           logoUrl: data.logoUrl !== undefined ? data.logoUrl : '/logo.svg',
           primaryColor: data.primaryColor || '#0f172a',
           restrictAcrossApp: data.restrictAcrossApp !== undefined ? Boolean(data.restrictAcrossApp) : true,
@@ -121,6 +122,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const updated: BrandingInfo = {
       ...branding,
       ...newBranding,
+      ...(newBranding.companyName !== undefined
+        ? { companyName: normalizeSyMetricText(newBranding.companyName) }
+        : {})
     };
     setBranding(updated);
     try {

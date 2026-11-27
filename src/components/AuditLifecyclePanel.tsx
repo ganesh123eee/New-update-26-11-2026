@@ -1,18 +1,30 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   ArrowRightCircle,
   BellRing,
   CheckCircle2,
   Clock,
   Download,
+  FileCheck2,
+  FileText,
   History,
+  Loader2,
+  Mail,
+  PenTool,
   PlayCircle,
   ShieldCheck,
   UserCheck,
-  Users,
-  FileCheck2
+  Users
 } from 'lucide-react';
-import { cn, formatDateTime } from '../lib/utils';
+import { toast } from 'sonner';
+import { useAuth } from '../contexts/AuthContext';
+import {
+  cn,
+  formatAuditTimestamp,
+  formatDateTime,
+  formatIsoDateOnly,
+  normalizeSyMetricText
+} from '../lib/utils';
 import {
   EnrichedAuditLog,
   formatActorInline,
@@ -21,6 +33,8 @@ import {
   LifecycleStage,
   LifecycleTimelineEvent
 } from '../utils/auditLifecycle';
+import { generateFinalAuditReportPdf } from '../utils/finalAuditReportPdf';
+import { sanitizeReportBrandName } from '../utils/pdfBranding';
 
 interface AuditLifecyclePanelProps {
   summary: LifecycleReportSummary;
@@ -85,11 +99,13 @@ export function exportLifecycleCsv(summary: LifecycleReportSummary, filenamePref
     'Step #',
     'Stage',
     'Timestamp',
-    'Action / Milestone',
+    'When (Timing / Context)',
+    'Action',
+    'Why Action Was Performed',
     'Initiated By',
-    'Performed By Name',
+    'Performed By (Name)',
     'Performed By Employee ID',
-    'Performed By Email',
+    'Performed By Email ID',
     'Performed By Role',
     'All Involved in Activity',
     'Notified When Finished',
@@ -100,21 +116,23 @@ export function exportLifecycleCsv(summary: LifecycleReportSummary, filenamePref
   ];
 
   const rows = summary.events.map((ev, idx) => [
-    idx + 1,
+    String(idx + 1).padStart(2, '0'),
     ev.stage,
-    ev.timestamp ? formatDateTime(ev.timestamp) : '-',
-    ev.action,
-    ev.initiatedBy ? formatActorInline(ev.initiatedBy) : formatActorInline(summary.initiatedBy),
-    ev.actor.name,
-    ev.actor.employeeId || '-',
-    ev.actor.email || '-',
+    ev.timestamp ? formatAuditTimestamp(ev.timestamp) : '-',
+    ev.when || '-',
+    normalizeSyMetricText(ev.action),
+    normalizeSyMetricText(ev.why || '-'),
+    normalizeSyMetricText(ev.initiatedBy ? formatActorInline(ev.initiatedBy) : formatActorInline(summary.initiatedBy)),
+    normalizeSyMetricText(ev.actor.name),
+    ev.actor.employeeId || '—',
+    ev.actor.email || '—',
     ev.actor.role || '-',
     ev.involvedParties
       .map((p) => `${p.roleInActivity}: ${p.name}${p.employeeId ? ` [${p.employeeId}]` : ''}${p.email ? ` (${p.email})` : ''}`)
       .join(' | '),
     ev.notifiedOnFinish.join(' | ') || '-',
     ev.nextAfterFinish || '-',
-    ev.summary,
+    normalizeSyMetricText(ev.summary),
     (ev.changes || []).map((c) => `${c.field}: ${c.from ?? '-'} -> ${c.to ?? '-'}`).join('; '),
     formatDetailEntries(ev.details)
       .map((d) => `${d.label}: ${d.value}`)
@@ -158,6 +176,30 @@ export const SingleActivityDetailCard: React.FC<{ log: EnrichedAuditLog }> = ({ 
           </p>
         </div>
         <span className="text-xs font-mono text-muted-foreground">{formatDateTime(log.timestamp)}</span>
+      </div>
+
+      {/* 5 Ws Audit Summary */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2.5 p-3 rounded-xl border bg-muted/25 text-xs">
+        <div>
+          <p className="text-[10px] font-bold uppercase text-muted-foreground">Date &amp; Time</p>
+          <p className="font-mono font-semibold text-foreground">{formatDateTime(log.timestamp)}</p>
+        </div>
+        <div>
+          <p className="text-[10px] font-bold uppercase text-muted-foreground">Who Performed</p>
+          <p className="font-semibold text-foreground">{formatActorInline(log.actor)}</p>
+        </div>
+        <div>
+          <p className="text-[10px] font-bold uppercase text-muted-foreground">When</p>
+          <p className="font-medium text-foreground">{log.when || log.stage}</p>
+        </div>
+        <div>
+          <p className="text-[10px] font-bold uppercase text-muted-foreground">What Action</p>
+          <p className="font-semibold text-foreground">{log.action}</p>
+        </div>
+        <div>
+          <p className="text-[10px] font-bold uppercase text-muted-foreground">Why</p>
+          <p className="font-medium text-foreground">{log.why || 'Audit compliance record'}</p>
+        </div>
       </div>
 
       {/* Initiated By & Performed By */}
@@ -285,12 +327,60 @@ export const SingleActivityDetailCard: React.FC<{ log: EnrichedAuditLog }> = ({ 
   );
 };
 
+const HistoryActionIcon: React.FC<{ stage: LifecycleStage; action: string }> = ({ stage, action }) => {
+  const act = action.toLowerCase();
+  if (stage === 'Closing' || act.includes('completed') || act.includes('closed')) {
+    return <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />;
+  }
+  if (stage === 'Review / Signature' || act.includes('signed')) {
+    return <PenTool className="w-4 h-4 text-emerald-700 shrink-0 mt-0.5" />;
+  }
+  if (act.includes('email') || act.includes('assigned') || act.includes('started signing') || act.includes('notif')) {
+    return <Mail className="w-4 h-4 text-sky-600 shrink-0 mt-0.5" />;
+  }
+  if (stage === 'In Progress' && act.includes('opened')) {
+    return <FileText className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />;
+  }
+  return <FileText className="w-4 h-4 text-orange-700 shrink-0 mt-0.5" />;
+};
+
 export const AuditLifecyclePanel: React.FC<AuditLifecyclePanelProps> = ({
   summary,
   compact = false,
   onExportCsv,
   title
 }) => {
+  const { branding } = useAuth();
+  const [viewMode, setViewMode] = useState<'final_report' | 'lifecycle_trace'>('final_report');
+  const [exportingPdf, setExportingPdf] = useState(false);
+
+  const cleanReportTitle =
+    normalizeSyMetricText(sanitizeReportBrandName(summary.entityTitle)) || 'Audit Report';
+  const initiatorLine = [
+    normalizeSyMetricText(summary.initiatedBy.name),
+    summary.initiatedBy.employeeId ? `[${summary.initiatedBy.employeeId}]` : '',
+    summary.initiatedBy.email ? `(${summary.initiatedBy.email})` : ''
+  ]
+    .filter(Boolean)
+    .join(' ');
+  const createdDateStr = formatIsoDateOnly(
+    summary.initiatedBy.timestamp || summary.events[0]?.timestamp
+  );
+  const generatedDateStr = formatIsoDateOnly(new Date());
+
+  const handleDownloadPdf = async () => {
+    setExportingPdf(true);
+    try {
+      await generateFinalAuditReportPdf(summary, branding);
+      toast.success('Final Audit Report PDF downloaded');
+    } catch (err) {
+      console.error('Failed to generate Final Audit Report PDF:', err);
+      toast.error('Failed to generate Final Audit Report PDF');
+    } finally {
+      setExportingPdf(false);
+    }
+  };
+
   return (
     <div className="space-y-4">
       {/* Header & Lifecycle Summary Overview */}
@@ -307,7 +397,7 @@ export const AuditLifecyclePanel: React.FC<AuditLifecyclePanelProps> = ({
                 </h3>
                 <span
                   className={cn(
-                    'px-2 py-0.5 rounded-full text-[10px] font-bold uppercase border',
+                    'px-2 py-0.5 rounded text-[11px] font-semibold border',
                     summary.isClosed
                       ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
                       : 'bg-amber-50 text-amber-800 border-amber-200'
@@ -317,20 +407,218 @@ export const AuditLifecyclePanel: React.FC<AuditLifecyclePanelProps> = ({
                 </span>
               </div>
               <p className="text-xs text-muted-foreground mt-0.5">
-                {summary.entityTitle} • ID: <span className="font-mono">{summary.entityId}</span> • {summary.events.length} total activities tracked
+                {cleanReportTitle} • Transaction ID: <span className="font-mono tabular-nums">{summary.entityId}</span> • {summary.events.length} tracked steps
               </p>
             </div>
           </div>
 
-          <button
-            type="button"
-            onClick={onExportCsv || (() => exportLifecycleCsv(summary, 'lifecycle_audit'))}
-            className="flex items-center gap-1.5 px-3 py-1.5 border rounded-lg text-xs font-bold hover:bg-accent transition-colors"
-          >
-            <Download className="w-3.5 h-3.5" />
-            <span>Export Full Lifecycle CSV</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="inline-flex rounded-lg border bg-muted/40 p-0.5">
+              <button
+                type="button"
+                onClick={() => setViewMode('final_report')}
+                className={cn(
+                  'px-2.5 py-1 rounded-md text-xs font-semibold transition-colors whitespace-nowrap shrink-0',
+                  viewMode === 'final_report'
+                    ? 'bg-background text-foreground shadow-xs'
+                    : 'text-muted-foreground hover:text-foreground'
+                )}
+              >
+                Final Audit Report
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewMode('lifecycle_trace')}
+                className={cn(
+                  'px-2.5 py-1 rounded-md text-xs font-semibold transition-colors whitespace-nowrap shrink-0',
+                  viewMode === 'lifecycle_trace'
+                    ? 'bg-background text-foreground shadow-xs'
+                    : 'text-muted-foreground hover:text-foreground'
+                )}
+              >
+                Full Lifecycle Trace
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={handleDownloadPdf}
+              disabled={exportingPdf}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-sky-600 text-white rounded-lg text-xs font-semibold hover:bg-sky-700 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0"
+            >
+              {exportingPdf ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileText className="w-3.5 h-3.5" />}
+              <span>Final Audit Report PDF</span>
+            </button>
+            <button
+              type="button"
+              onClick={onExportCsv || (() => exportLifecycleCsv(summary, 'lifecycle_audit'))}
+              className="flex items-center gap-1.5 px-3 py-1.5 border rounded-lg text-xs font-semibold hover:bg-accent transition-colors whitespace-nowrap shrink-0"
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span>Export CSV</span>
+            </button>
+          </div>
         </div>
+      </div>
+
+      {viewMode === 'final_report' ? (
+        <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-6 space-y-5">
+              <div className="space-y-1.5">
+                <h2 className="text-2xl font-normal text-sky-600 leading-snug">
+                  {cleanReportTitle}
+                </h2>
+                <div className="flex items-center justify-between text-xs text-slate-900">
+                  <span className="font-medium">Final Audit Report</span>
+                  <span className="font-mono tabular-nums">{generatedDateStr}</span>
+                </div>
+              </div>
+
+              <div className="bg-slate-100 border border-slate-700/80 px-4 py-3 text-xs">
+                <dl className="grid grid-cols-[120px_1fr] gap-y-2 gap-x-4">
+                  <dt className="text-slate-700 font-medium">Created:</dt>
+                  <dd className="text-slate-900 font-mono tabular-nums">{createdDateStr}</dd>
+
+                  <dt className="text-slate-700 font-medium">By:</dt>
+                  <dd className="text-slate-900">{initiatorLine}</dd>
+
+                  <dt className="text-slate-700 font-medium">Status:</dt>
+                  <dd className="text-slate-900 font-medium">{summary.currentStatus}</dd>
+
+                  <dt className="text-slate-700 font-medium">Transaction ID:</dt>
+                  <dd className="text-slate-900 font-mono tabular-nums break-all">{summary.entityId}</dd>
+                </dl>
+              </div>
+
+              {/* "<Report Title>" History */}
+              <div className="space-y-4 pt-2">
+                <h3 className="text-lg font-normal text-slate-900">
+                  &ldquo;{cleanReportTitle}&rdquo; History
+                </h3>
+
+                {summary.events.length === 0 ? (
+                  <p className="text-xs text-slate-500 py-4 border rounded-lg px-4 bg-slate-50">
+                    No activity history recorded yet.
+                  </p>
+                ) : (
+                  <div className="space-y-4">
+                    {summary.events.map((ev, idx) => (
+                      <div key={ev.id || idx} className="flex items-start gap-3">
+                        <HistoryActionIcon stage={ev.stage} action={ev.action} />
+                        <div className="space-y-0.5 text-xs">
+                          <p className="text-slate-900 leading-snug">
+                            <span className="font-mono tabular-nums font-semibold text-slate-500 mr-1.5">
+                              Step {String(idx + 1).padStart(2, '0')}
+                            </span>
+                            <span className="font-semibold text-slate-800 mr-1.5">[{ev.stage}]</span>
+                            <span className="font-medium text-slate-900">{normalizeSyMetricText(ev.action)}</span>
+                            <span className="text-slate-700">
+                              {' '}— Performed by{' '}
+                              <span className="font-semibold text-slate-900">{normalizeSyMetricText(ev.actor.name)}</span>
+                              {ev.actor.employeeId ? (
+                                <span className="font-mono tabular-nums text-slate-700"> [EMP ID: {ev.actor.employeeId}]</span>
+                              ) : null}
+                              {ev.actor.email ? (
+                                <span className="font-mono text-slate-600"> ({ev.actor.email})</span>
+                              ) : null}
+                            </span>
+                          </p>
+                          <p className="text-[11px] font-mono tabular-nums text-slate-600">
+                            {ev.timestamp ? formatAuditTimestamp(ev.timestamp) : 'Timestamp unavailable'}
+                            {ev.why ? ` — ${normalizeSyMetricText(ev.why)}` : ''}
+                          </p>
+                          {Array.isArray(ev.changes) && ev.changes.length > 0 && (
+                            <div className="pt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] font-mono text-slate-700">
+                              {ev.changes.map((c, cIdx) => (
+                                <span key={cIdx}>
+                                  <span className="font-semibold text-slate-800">{c.field}:</span>{' '}
+                                  <span className="text-rose-700 line-through">{String(c.from ?? '—')}</span>{' '}
+                                  &rarr;{' '}
+                                  <span className="text-emerald-700 font-semibold">{String(c.to ?? '—')}</span>
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Structured Audit Steps Table: Steps, Stage, Timestamp, Action & Changes, Performed By Employee ID, Performed By Email ID */}
+              <div className="pt-4 border-t border-slate-200 space-y-2.5">
+                <h4 className="text-xs font-bold uppercase tracking-wider text-slate-600">
+                  Audit Trail Breakdown (Steps, Stage, Timestamp, Action &amp; Changes, Performed By Employee ID &amp; Email ID)
+                </h4>
+                <div className="overflow-x-auto border border-slate-200 rounded-lg">
+                  <table className="w-full text-left text-xs border-collapse">
+                    <thead className="bg-slate-50 border-b border-slate-200 text-slate-600 uppercase text-[11px]">
+                      <tr>
+                        <th className="px-3 py-2.5 font-semibold whitespace-nowrap">Steps</th>
+                        <th className="px-3 py-2.5 font-semibold whitespace-nowrap">Stage</th>
+                        <th className="px-3 py-2.5 font-semibold whitespace-nowrap">Timestamp</th>
+                        <th className="px-3 py-2.5 font-semibold">Action &amp; Tracked Changes</th>
+                        <th className="px-3 py-2.5 font-semibold whitespace-nowrap">Performed By</th>
+                        <th className="px-3 py-2.5 font-semibold whitespace-nowrap">Performed By Employee ID</th>
+                        <th className="px-3 py-2.5 font-semibold whitespace-nowrap">Performed By Email ID</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-200">
+                      {summary.events.length === 0 ? (
+                        <tr>
+                          <td colSpan={7} className="px-4 py-6 text-center text-slate-500">
+                            No steps recorded yet.
+                          </td>
+                        </tr>
+                      ) : (
+                        summary.events.map((ev, idx) => (
+                          <tr key={ev.id || idx} className="hover:bg-slate-50/80 transition-colors align-top">
+                            <td className="px-3 py-2.5 font-mono tabular-nums font-semibold text-slate-900 whitespace-nowrap">
+                              {String(idx + 1).padStart(2, '0')}
+                            </td>
+                            <td className="px-3 py-2.5 font-medium text-slate-800 whitespace-nowrap">
+                              {ev.stage}
+                            </td>
+                            <td className="px-3 py-2.5 font-mono tabular-nums text-[11px] text-slate-700 whitespace-nowrap">
+                              {ev.timestamp ? formatAuditTimestamp(ev.timestamp) : 'N/A'}
+                            </td>
+                            <td className="px-3 py-2.5 text-slate-900 space-y-1">
+                              <p className="font-medium">{normalizeSyMetricText(ev.action)}</p>
+                              {ev.when && (
+                                <p className="text-[11px] text-slate-500">{normalizeSyMetricText(ev.when)}</p>
+                              )}
+                              {Array.isArray(ev.changes) && ev.changes.length > 0 && (
+                                <div className="pt-0.5 space-y-0.5 font-mono text-[11px] text-slate-700 border-t border-slate-100">
+                                  {ev.changes.map((c, cIdx) => (
+                                    <div key={cIdx}>
+                                      <span className="font-semibold text-slate-800">{c.field}:</span>{' '}
+                                      <span className="text-rose-700 line-through">{String(c.from ?? '—')}</span>{' '}
+                                      &rarr;{' '}
+                                      <span className="text-emerald-700 font-semibold">{String(c.to ?? '—')}</span>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                            </td>
+                            <td className="px-3 py-2.5 text-slate-900 whitespace-nowrap">
+                              {normalizeSyMetricText(ev.actor.name)}
+                            </td>
+                            <td className="px-3 py-2.5 font-mono tabular-nums text-slate-800 whitespace-nowrap">
+                              {ev.actor.employeeId || '—'}
+                            </td>
+                            <td className="px-3 py-2.5 font-mono text-[11px] text-slate-700 whitespace-nowrap">
+                              {ev.actor.email || '—'}
+                            </td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+        </div>
+      ) : (
+        <React.Fragment>
+          <div className="bg-card border rounded-2xl shadow-sm p-5 space-y-4">
 
         {/* Key Ownership Cards: Initiated By -> Assigned Owner / Candidate -> Closed By */}
         <div className={cn('grid gap-3', compact ? 'grid-cols-1 md:grid-cols-2' : 'grid-cols-1 md:grid-cols-3')}>
@@ -569,6 +857,26 @@ export const AuditLifecyclePanel: React.FC<AuditLifecyclePanelProps> = ({
                     {/* Human-readable Summary */}
                     <p className="text-xs text-foreground/90">{ev.summary}</p>
 
+                    {/* 5 Ws Audit Trace */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 p-2.5 rounded-lg border bg-muted/20 text-[11px]">
+                      <div>
+                        <span className="text-[10px] font-bold uppercase text-muted-foreground block">Date &amp; Time</span>
+                        <span className="font-mono font-semibold text-foreground">{ev.timestamp ? formatDateTime(ev.timestamp) : 'N/A'}</span>
+                      </div>
+                      <div>
+                        <span className="text-[10px] font-bold uppercase text-muted-foreground block">Who</span>
+                        <span className="font-semibold text-foreground">{ev.actor.name}</span>
+                      </div>
+                      <div>
+                        <span className="text-[10px] font-bold uppercase text-muted-foreground block">When</span>
+                        <span className="font-medium text-foreground">{ev.when || ev.stage}</span>
+                      </div>
+                      <div>
+                        <span className="text-[10px] font-bold uppercase text-muted-foreground block">Why</span>
+                        <span className="font-medium text-foreground">{ev.why}</span>
+                      </div>
+                    </div>
+
                     {/* All Involved in This Single Activity */}
                     {ev.involvedParties && ev.involvedParties.length > 0 && (
                       <div className="p-2.5 rounded-lg border bg-muted/20 space-y-1">
@@ -655,6 +963,8 @@ export const AuditLifecyclePanel: React.FC<AuditLifecyclePanelProps> = ({
           </div>
         )}
       </div>
+        </React.Fragment>
+      )}
     </div>
   );
 };

@@ -125,8 +125,8 @@ export interface Evaluation {
   questionScores: Record<string, number>;
   questionComments: Record<string, string>;
   overallComments: string;
-  strengths: string;
-  improvements: string;
+  strengths?: string;
+  improvements?: string;
   finalScore: number;
   result: 'pass' | 'fail';
   retestRequired: boolean;
@@ -146,6 +146,8 @@ export interface AuditLog {
   action: string;
   module: string;
   timestamp: string;
+  when?: string;
+  why?: string;
   details: any;
   entityType?: 'assessment_report' | 'training_register' | 'submission' | 'template' | 'assignment' | 'system' | string;
   entityId?: string;
@@ -162,6 +164,7 @@ export interface Department {
 export interface TrainingAttendee {
   id: string;
   slNo: number;
+  userId?: string;
   employeeId?: string;
   traineeName: string;
   email?: string;
@@ -173,6 +176,15 @@ export interface TrainingAttendee {
   documentReviewed?: boolean;
   documentReviewedAt?: string;
   status: 'pending' | 'signed' | 'waiting';
+}
+
+export interface TrainingRegisterOpenRecord {
+  uid?: string;
+  employeeId?: string;
+  email?: string;
+  name: string;
+  role: 'trainer' | 'trainee' | 'manager';
+  openedAt: string;
 }
 
 export interface TrainingRegister {
@@ -190,6 +202,7 @@ export interface TrainingRegister {
   trainerSignedAt?: string;
   trainerDocumentReviewed?: boolean;
   trainerDocumentReviewedAt?: string;
+  openedBy?: TrainingRegisterOpenRecord[];
   assessmentConducted: 'Yes' | 'No';
   assessmentComment?: string;
   documentTitle?: string;

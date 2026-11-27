@@ -16,18 +16,23 @@ import {
   Eye,
   X,
   Loader2,
-  Calendar
+  Calendar,
+  History
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { toast } from 'sonner';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { firestoreService } from '../services/firestoreService';
+import { trainingRegisterService } from '../services/trainingRegisterService';
 import { useAuth } from '../contexts/AuthContext';
-import { Assignment, Template, Submission, Evaluation, User as UserType, Department } from '../types';
-import { formatDate, formatDateTime, formatSignatureDate, cn, formatId } from '../lib/utils';
+import { Assignment, Template, Submission, Evaluation, User as UserType, Department, AuditLog, TrainingRegisterTemplateConfig } from '../types';
+import { formatDate, formatDateTime, formatSignatureDate, cn, formatId, formatQuestionnaireVersion } from '../lib/utils';
 import { drawPdfBrandingHeader } from '../utils/pdfBranding';
 import { BrandLogo } from '../components/BrandLogo';
+import { AuditLifecyclePanel } from '../components/AuditLifecyclePanel';
+import { buildEvaluationReportLifecycle, LifecycleReportSummary, matchesSubmissionOrAssignmentLog } from '../utils/auditLifecycle';
+import { generateFinalAuditReportPdf } from '../utils/finalAuditReportPdf';
 
 type TabType = 'active' | 'results' | 'reports'; // Keeping for type safety if needed elsewhere, but activeTab is removed
 
@@ -52,6 +57,8 @@ export default function MyAssessments() {
   const [tempSearch, setTempSearch] = useState('');
   const [selectedResult, setSelectedResult] = useState<ResultItem | null>(null);
   const [modalExtraData, setModalExtraData] = useState<{ reviewerName: string; deptName: string; } | null>(null);
+  const [resultLifecycleSummary, setResultLifecycleSummary] = useState<LifecycleReportSummary | null>(null);
+  const [exportingAuditPdf, setExportingAuditPdf] = useState(false);
 
   useEffect(() => {
     const loadData = async () => {
@@ -184,6 +191,7 @@ export default function MyAssessments() {
 
   const handleViewReport = async (item: ResultItem) => {
     setSelectedResult(item);
+    setResultLifecycleSummary(null);
     if (item.evaluation) {
       try {
         const [reviewer, dept] = await Promise.all([
@@ -199,6 +207,36 @@ export default function MyAssessments() {
         console.error('Error fetching modal extra data:', error);
         setModalExtraData({ reviewerName: 'N/A', deptName: 'N/A' });
       }
+    } else {
+      const dept = user?.departmentId
+        ? await firestoreService.getDocument<Department>('departments', user.departmentId).catch(() => null)
+        : null;
+      setModalExtraData({ reviewerName: 'Pending Evaluation', deptName: dept?.name || 'N/A' });
+    }
+
+    try {
+      const [allLogs, allUsers, tmplCfg] = await Promise.all([
+        firestoreService.getCollection<AuditLog>('auditLogs').catch(() => [] as AuditLog[]),
+        firestoreService.getCollection<UserType>('users').catch(() => (user ? [user] : [])),
+        trainingRegisterService.getTemplateConfig().catch(() => null as TrainingRegisterTemplateConfig | null)
+      ]);
+      const relatedLogs = allLogs.filter(l =>
+        matchesSubmissionOrAssignmentLog(l, item.submission.id, item.assignment?.id)
+      );
+      setResultLifecycleSummary(
+        buildEvaluationReportLifecycle({
+          submission: item.submission,
+          assignment: item.assignment || null,
+          evaluation: item.evaluation || null,
+          template: item.template || null,
+          users: allUsers.length > 0 ? allUsers : (user ? [user] : []),
+          departments,
+          logs: relatedLogs,
+          templateConfig: tmplCfg
+        })
+      );
+    } catch (err) {
+      console.error('Failed to build report lifecycle summary:', err);
     }
   };
 
@@ -264,7 +302,8 @@ export default function MyAssessments() {
       // Assessment Info
       const trainerName = reviewer?.displayName === 'System Admin' ? (user?.displayName || 'Super Admin') : (reviewer?.displayName || 'N/A');
       doc.text(`SOP Name: ${template?.name || 'N/A'}`, 110, infoStartY);
-      doc.text(`SOP Version: ${template?.version || 'V1.0'}`, 110, infoStartY + 6);
+      const sopVersion = formatQuestionnaireVersion(template?.version);
+      doc.text(`SOP Version: ${sopVersion || '—'}`, 110, infoStartY + 6);
       doc.text(`Trainer Name: ${trainerName}`, 110, infoStartY + 12);
       doc.text(`Submitted At: ${formatDateTime(submission.submittedAt)}`, 110, infoStartY + 18);
       doc.text(`Duration: ${Math.floor(submission.durationTaken / 60)}m ${submission.durationTaken % 60}s`, 110, infoStartY + 24);
@@ -348,17 +387,17 @@ export default function MyAssessments() {
       const finalY = (doc as any).lastAutoTable.finalY + 10;
 
       // Reviewer Comments
-      if (finalY < 240) {
+      if (finalY < 245) {
         doc.setFontSize(12);
         doc.text('Reviewer Feedback', 14, finalY);
         doc.setFontSize(10);
-        doc.text(`Overall Comments: ${evaluation.overallComments || 'None'}`, 14, finalY + 8);
-        doc.text(`Strengths: ${evaluation.strengths || 'None'}`, 14, finalY + 16);
-        doc.text(`Areas for Improvement: ${evaluation.improvements || 'None'}`, 14, finalY + 24);
-        doc.text(`Reviewer: ${trainerName}`, 14, finalY + 32);
+        const splitComments = doc.splitTextToSize(`Overall Comments: ${evaluation.overallComments || 'None'}`, 180);
+        doc.text(splitComments, 14, finalY + 8);
+        const reviewerY = finalY + 8 + Math.max(splitComments.length * 5, 6) + 2;
+        doc.text(`Reviewer: ${trainerName}`, 14, reviewerY);
 
         // Digital Signatures
-        const sigY = finalY + 60;
+        const sigY = reviewerY + 26;
         
         // Employee Signature
         doc.setDrawColor(200);
@@ -388,13 +427,13 @@ export default function MyAssessments() {
         doc.setFontSize(12);
         doc.text('Reviewer Feedback', 14, 20);
         doc.setFontSize(10);
-        doc.text(`Overall Comments: ${evaluation.overallComments || 'None'}`, 14, 28);
-        doc.text(`Strengths: ${evaluation.strengths || 'None'}`, 14, 36);
-        doc.text(`Areas for Improvement: ${evaluation.improvements || 'None'}`, 14, 44);
-        doc.text(`Reviewer: ${trainerName}`, 14, 52);
+        const splitComments = doc.splitTextToSize(`Overall Comments: ${evaluation.overallComments || 'None'}`, 180);
+        doc.text(splitComments, 14, 28);
+        const reviewerY = 28 + Math.max(splitComments.length * 5, 6) + 2;
+        doc.text(`Reviewer: ${trainerName}`, 14, reviewerY);
 
         // Digital Signatures on new page
-        const sigY = 80;
+        const sigY = reviewerY + 26;
         // Employee Signature
         doc.setDrawColor(200);
         doc.line(14, sigY, 90, sigY);
@@ -684,6 +723,7 @@ export default function MyAssessments() {
                 onClick={() => {
                   setSelectedResult(null);
                   setModalExtraData(null);
+                  setResultLifecycleSummary(null);
                 }}
                 className="p-2 hover:bg-accent rounded-full transition-colors"
               >
@@ -712,7 +752,7 @@ export default function MyAssessments() {
                     <span className="text-muted-foreground">SOP Name:</span>
                     <span className="font-medium">{selectedResult.template?.name || 'N/A'}</span>
                     <span className="text-muted-foreground">SOP Version:</span>
-                    <span className="font-mono font-bold text-primary">{selectedResult.template?.version || 'V1.0'}</span>
+                    <span className="font-mono font-bold text-primary">{formatQuestionnaireVersion(selectedResult.template?.version) || '—'}</span>
                     <span className="text-muted-foreground">Trainer Name:</span>
                     <span className="font-medium">{modalExtraData?.reviewerName || 'Loading...'}</span>
                     <span className="text-muted-foreground">Submitted At:</span>
@@ -827,20 +867,6 @@ export default function MyAssessments() {
                           "{selectedResult.evaluation.overallComments || 'No overall comments provided.'}"
                         </div>
                       </div>
-                      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                        <div>
-                          <p className="text-xs font-bold uppercase text-emerald-600 mb-2">Key Strengths</p>
-                          <div className="p-4 bg-emerald-50/50 rounded-xl text-sm text-emerald-800 border border-emerald-100">
-                            {selectedResult.evaluation.strengths || 'No strengths noted.'}
-                          </div>
-                        </div>
-                        <div>
-                          <p className="text-xs font-bold uppercase text-amber-600 mb-2">Areas for Improvement</p>
-                          <div className="p-4 bg-amber-50/50 rounded-xl text-sm text-amber-800 border border-amber-100">
-                            {selectedResult.evaluation.improvements || 'No improvements noted.'}
-                          </div>
-                        </div>
-                      </div>
                       
                       <div className="pt-6 border-t flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
                         <div className="flex items-center gap-3">
@@ -887,25 +913,58 @@ export default function MyAssessments() {
                   <p className="text-muted-foreground mt-2 max-w-md mx-auto">Your assessment is currently being reviewed by an administrator. Please check back later for your final score and feedback.</p>
                 </div>
               )}
+
+              {resultLifecycleSummary && (
+                <AuditLifecyclePanel
+                  summary={resultLifecycleSummary}
+                  compact
+                  title="Report Audit Trail (Changes & Activities)"
+                />
+              )}
             </div>
 
-            <div className="p-6 bg-muted/30 border-t flex justify-between items-center">
-              {selectedResult.evaluation && (
-                <button 
-                  onClick={() => handleDownloadIndividualReport(selectedResult)}
-                  disabled={exporting}
-                  className="flex items-center gap-2 px-6 py-2.5 bg-emerald-600 text-white rounded-xl font-bold hover:bg-emerald-700 transition-all shadow-lg shadow-emerald-600/20 disabled:opacity-50"
-                >
-                  {exporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
-                  <span>Download Report (PDF)</span>
-                </button>
-              )}
+            <div className="p-6 bg-muted/30 border-t flex flex-wrap justify-between items-center gap-3">
+              <div className="flex flex-wrap items-center gap-3">
+                {selectedResult.evaluation && (
+                  <button 
+                    onClick={() => handleDownloadIndividualReport(selectedResult)}
+                    disabled={exporting}
+                    className="flex items-center gap-2 px-5 py-2.5 bg-emerald-600 text-white rounded-xl font-bold hover:bg-emerald-700 transition-all shadow-lg shadow-emerald-600/20 disabled:opacity-50 whitespace-nowrap shrink-0"
+                  >
+                    {exporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                    <span>Download Report (PDF)</span>
+                  </button>
+                )}
+                {resultLifecycleSummary && (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      setExportingAuditPdf(true);
+                      try {
+                        await generateFinalAuditReportPdf(resultLifecycleSummary, branding);
+                        toast.success('Final Audit Report PDF downloaded');
+                      } catch (err) {
+                        console.error('Failed to download Final Audit Report PDF:', err);
+                        toast.error('Failed to download Final Audit Report PDF.');
+                      } finally {
+                        setExportingAuditPdf(false);
+                      }
+                    }}
+                    disabled={exportingAuditPdf}
+                    className="flex items-center gap-2 px-5 py-2.5 bg-sky-600 text-white rounded-xl font-bold hover:bg-sky-700 transition-all shadow-lg shadow-sky-600/20 disabled:opacity-50 whitespace-nowrap shrink-0"
+                  >
+                    {exportingAuditPdf ? <Loader2 className="w-4 h-4 animate-spin" /> : <History className="w-4 h-4" />}
+                    <span>Final Audit Report PDF</span>
+                  </button>
+                )}
+              </div>
               <button 
                 onClick={() => {
                   setSelectedResult(null);
                   setModalExtraData(null);
+                  setResultLifecycleSummary(null);
                 }}
-                className="px-8 py-2.5 bg-primary text-primary-foreground rounded-xl font-bold hover:opacity-90 transition-all shadow-lg shadow-primary/20"
+                className="px-8 py-2.5 bg-primary text-primary-foreground rounded-xl font-bold hover:opacity-90 transition-all shadow-lg shadow-primary/20 whitespace-nowrap shrink-0 ml-auto"
               >
                 Close
               </button>

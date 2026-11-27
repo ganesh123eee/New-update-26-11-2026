@@ -1,7 +1,7 @@
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import { TrainingRegister, TrainingRegisterTemplateConfig, TrainingAttendee, User as UserType } from '../types';
-import { formatDate } from '../lib/utils';
+import { formatDate, formatQuestionnaireVersion } from '../lib/utils';
 import { firestoreService } from './firestoreService';
 import { drawPdfBrandingHeader } from '../utils/pdfBranding';
 
@@ -33,6 +33,41 @@ async function getImageDimensions(src: string): Promise<{ width: number; height:
     };
     img.src = src;
   });
+}
+
+async function resolveUserRecipient(hints: {
+  userId?: string;
+  employeeId?: string;
+  email?: string;
+  name?: string;
+}): Promise<{ uid?: string; email?: string }> {
+  try {
+    const users = await firestoreService.getCollection<UserType>('users');
+    const cleanEmail = hints.email?.toLowerCase().trim();
+    const cleanEmpId = hints.employeeId?.toLowerCase().trim();
+    const cleanName = hints.name?.toLowerCase().trim();
+
+    const matched = users.find((u) => {
+      if (hints.userId && (u.uid === hints.userId || u.id === hints.userId)) return true;
+      if (cleanEmail && u.email?.toLowerCase().trim() === cleanEmail) return true;
+      if (cleanEmpId && (u.uid?.toLowerCase().trim() === cleanEmpId || u.employeeId?.toLowerCase().trim() === cleanEmpId)) {
+        return true;
+      }
+      if (cleanName && u.displayName?.toLowerCase().trim() === cleanName) return true;
+      return false;
+    });
+
+    return {
+      uid: matched?.uid || matched?.id || hints.userId || (hints.employeeId?.includes('@') ? hints.employeeId : undefined),
+      email: matched?.email || hints.email
+    };
+  } catch (err) {
+    console.warn('Could not resolve user recipient for training register notification:', err);
+    return {
+      uid: hints.userId || hints.employeeId,
+      email: hints.email
+    };
+  }
 }
 
 export const trainingRegisterService = {
@@ -94,9 +129,17 @@ export const trainingRegisterService = {
     attendee: TrainingAttendee,
     appUrl: string = window.location.origin
   ): Promise<void> {
-    if (!attendee.email) return;
+    const resolved = await resolveUserRecipient({
+      userId: attendee.userId,
+      employeeId: attendee.employeeId,
+      email: attendee.email,
+      name: attendee.traineeName
+    });
 
-    const signUrl = `${appUrl}/training-registers/${register.id}?sign=trainee`;
+    const targetEmail = resolved.email || attendee.email;
+    const targetUid = resolved.uid || attendee.userId || attendee.employeeId;
+
+    const registerUrl = `${appUrl}/training-registers/${register.id}`;
     const html = `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 8px; background: #ffffff;">
         <div style="border-bottom: 2px solid #0f172a; padding-bottom: 12px; margin-bottom: 20px;">
@@ -107,7 +150,7 @@ export const trainingRegisterService = {
         <p style="font-size: 15px; color: #1e293b;">Dear <strong>${attendee.traineeName}</strong>,</p>
         
         <p style="font-size: 14px; color: #334155; line-height: 1.6;">
-          Your digital attendance signature is required for the following completed training session:
+          Your digital attendance signature is required for the following completed training session. Please open the Training Register, review the session details and training document, and then apply your signature:
         </p>
 
         <div style="background-color: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; padding: 16px; margin: 18px 0;">
@@ -140,31 +183,33 @@ export const trainingRegisterService = {
         </div>
 
         <div style="text-align: center; margin: 28px 0;">
-          <a href="${signUrl}" style="background-color: #0f172a; color: #ffffff; text-decoration: none; padding: 12px 24px; border-radius: 6px; font-weight: bold; font-size: 14px; display: inline-block;">
-            Open Register & Provide Digital Signature
+          <a href="${registerUrl}" style="background-color: #0f172a; color: #ffffff; text-decoration: none; padding: 12px 24px; border-radius: 6px; font-weight: bold; font-size: 14px; display: inline-block;">
+            Open Training Register to Review &amp; Sign
           </a>
         </div>
 
         <p style="font-size: 12px; color: #64748b; line-height: 1.5; border-top: 1px solid #f1f5f9; padding-top: 12px;">
-          Note: This signature workflow is sequential. Once you sign, the next attendee will be automatically invited.
+          Note: The Training Register must be opened and the reference material reviewed before your digital signature can be recorded. Once you sign, the next attendee will be automatically notified.
         </p>
       </div>
     `;
 
-    await this.sendEmail(
-      attendee.email,
-      `Action Required: Digital Signature for Training - ${register.trainingTitle}`,
-      html
-    );
+    if (targetEmail) {
+      await this.sendEmail(
+        targetEmail,
+        `Action Required: Digital Signature for Training - ${register.trainingTitle}`,
+        html
+      );
+    }
 
-    // Create in-app notification if employee user ID is present
-    if (attendee.employeeId) {
+    // Create in-app notification using resolved user UID
+    if (targetUid) {
       await firestoreService.createDocument('notifications', {
-        userId: attendee.employeeId,
+        userId: targetUid,
         title: 'Training Register Signature Required',
-        message: `Please sign the training register for: ${register.trainingTitle} (${register.date})`,
+        message: `Please open and review the training register before signing: ${register.trainingTitle} (${register.date})`,
         type: 'warning',
-        link: `/training-registers/${register.id}?sign=trainee`,
+        link: `/training-registers/${register.id}`,
         read: false,
         createdAt: new Date().toISOString()
       });
@@ -175,9 +220,16 @@ export const trainingRegisterService = {
     register: TrainingRegister,
     appUrl: string = window.location.origin
   ): Promise<void> {
-    if (!register.trainerEmail) return;
+    const resolved = await resolveUserRecipient({
+      userId: register.trainerId,
+      email: register.trainerEmail,
+      name: register.trainerName
+    });
 
-    const signUrl = `${appUrl}/training-registers/${register.id}?sign=trainer`;
+    const targetEmail = resolved.email || register.trainerEmail;
+    const targetUid = resolved.uid || register.trainerId;
+
+    const registerUrl = `${appUrl}/training-registers/${register.id}`;
     const html = `
       <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 24px; border: 1px solid #e2e8f0; border-radius: 8px; background: #ffffff;">
         <div style="border-bottom: 2px solid #0f172a; padding-bottom: 12px; margin-bottom: 20px;">
@@ -209,30 +261,32 @@ export const trainingRegisterService = {
         </div>
 
         <p style="font-size: 14px; color: #334155;">
-          Please sign as the Trainer to officially complete the training register and release it to the Quality and IT teams.
+          Please open the Training Register, review the completed attendance and training material, and apply your Trainer signature to finalize and release it to the Quality and IT teams.
         </p>
 
         <div style="text-align: center; margin: 28px 0;">
-          <a href="${signUrl}" style="background-color: #16a34a; color: #ffffff; text-decoration: none; padding: 12px 24px; border-radius: 6px; font-weight: bold; font-size: 14px; display: inline-block;">
-            Sign as Trainer
+          <a href="${registerUrl}" style="background-color: #16a34a; color: #ffffff; text-decoration: none; padding: 12px 24px; border-radius: 6px; font-weight: bold; font-size: 14px; display: inline-block;">
+            Open Register &amp; Sign as Trainer
           </a>
         </div>
       </div>
     `;
 
-    await this.sendEmail(
-      register.trainerEmail,
-      `Action Required: Trainer Signature Needed - ${register.trainingTitle}`,
-      html
-    );
+    if (targetEmail) {
+      await this.sendEmail(
+        targetEmail,
+        `Action Required: Trainer Signature Needed - ${register.trainingTitle}`,
+        html
+      );
+    }
 
-    if (register.trainerId) {
+    if (targetUid) {
       await firestoreService.createDocument('notifications', {
-        userId: register.trainerId,
+        userId: targetUid,
         title: 'Trainer Signature Required',
-        message: `All attendees have signed. Please provide your Trainer signature for: ${register.trainingTitle}`,
+        message: `All attendees have signed. Please open and review the register, then provide your Trainer signature for: ${register.trainingTitle}`,
         type: 'info',
-        link: `/training-registers/${register.id}?sign=trainer`,
+        link: `/training-registers/${register.id}`,
         read: false,
         createdAt: new Date().toISOString()
       });
@@ -463,7 +517,7 @@ export const trainingRegisterService = {
         ...(register.documentTitle || register.documentCode ? [[
           { content: 'SOP / Material Reviewed', styles: { fontStyle: 'bold' as const, cellWidth: 38 } },
           {
-            content: `${register.documentTitle || 'Training Document'}${register.documentCode ? ` (${register.documentCode}${register.documentVersion ? ` ${register.documentVersion}` : ''})` : ''} — Mandatory pre-signature review ${register.requireDocumentReview !== false ? 'enforced' : 'optional'}`,
+            content: `${register.documentTitle || 'Training Document'}${register.documentCode ? ` (${register.documentCode}${formatQuestionnaireVersion(register.documentVersion) ? ` ${formatQuestionnaireVersion(register.documentVersion)}` : ''})` : ''} — Mandatory pre-signature review ${register.requireDocumentReview !== false ? 'enforced' : 'optional'}`,
             colSpan: 3
           }
         ]] : [])
@@ -543,6 +597,7 @@ export const trainingRegisterService = {
       // Accurately resolve Employee ID
       const matchedUser = allUsers.find(
         (u) =>
+          (attendee.userId && u.uid === attendee.userId) ||
           u.uid === attendee.employeeId ||
           (attendee.email && u.email?.toLowerCase().trim() === attendee.email.toLowerCase().trim()) ||
           (attendee.traineeName && u.displayName?.toLowerCase().trim() === attendee.traineeName.toLowerCase().trim()) ||

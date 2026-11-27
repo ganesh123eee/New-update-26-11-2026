@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate, Link, useSearchParams } from 'react-router-dom';
 import { 
   ArrowLeft, 
@@ -32,13 +32,14 @@ import { firestoreService } from '../services/firestoreService';
 import { 
   TrainingRegister, 
   TrainingAttendee, 
+  TrainingRegisterOpenRecord,
   TrainingRegisterTemplateConfig, 
   User as UserType,
   Template,
   AuditLog,
   AuditChange
 } from '../types';
-import { formatDate, formatDateTime, cn } from '../lib/utils';
+import { formatDate, formatDateTime, formatQuestionnaireVersion, cn } from '../lib/utils';
 import { trainingRegisterService, DEFAULT_TEMPLATE_CONFIG } from '../services/trainingRegisterService';
 import { SignaturePadModal } from '../components/SignaturePadModal';
 import { sanitizeReportBrandName } from '../utils/pdfBranding';
@@ -53,6 +54,29 @@ const isSafeHttpUrl = (url?: string): boolean => {
   } catch {
     return false;
   }
+};
+
+const matchesAttendeeUser = (attendee: TrainingAttendee, user?: UserType | null): boolean => {
+  if (!user || !attendee) return false;
+  const uEmail = user.email?.toLowerCase().trim() || '';
+  const aEmail = attendee.email?.toLowerCase().trim() || '';
+  if (attendee.userId && attendee.userId === user.uid) return true;
+  if (attendee.employeeId) {
+    if (attendee.employeeId === user.uid) return true;
+    if (user.employeeId && attendee.employeeId.trim() === user.employeeId.trim()) return true;
+  }
+  if (uEmail && aEmail && uEmail === aEmail) return true;
+  return false;
+};
+
+const matchesTrainerUser = (register: TrainingRegister, user?: UserType | null): boolean => {
+  if (!user || !register) return false;
+  const uEmail = user.email?.toLowerCase().trim() || '';
+  const uName = user.displayName?.toLowerCase().trim() || '';
+  if (register.trainerId && register.trainerId === user.uid) return true;
+  if (register.trainerEmail && uEmail && register.trainerEmail.toLowerCase().trim() === uEmail) return true;
+  if (register.trainerName && uName && register.trainerName.toLowerCase().trim() === uName) return true;
+  return false;
 };
 
 export default function TrainingRegisterDetail() {
@@ -114,6 +138,8 @@ export default function TrainingRegisterDetail() {
   const [registerAuditLogs, setRegisterAuditLogs] = useState<AuditLog[]>([]);
   const [docReviewModalOpen, setDocReviewModalOpen] = useState(false);
   const [docConfirming, setDocConfirming] = useState(false);
+  const [registerOpenedBanner, setRegisterOpenedBanner] = useState<string | null>(null);
+  const recordedOpenKeysRef = useRef<Set<string>>(new Set());
 
   // Realtime subscription to templates so future created templates appear automatically
   useEffect(() => {
@@ -219,20 +245,9 @@ export default function TrainingRegisterDetail() {
               id: doc.id || id,
               requireDocumentReview: doc.requireDocumentReview !== undefined ? doc.requireDocumentReview : true
             };
-            const userEmailLower = currentUser?.email?.toLowerCase().trim() || '';
-            const userNameLower = currentUser?.displayName?.toLowerCase().trim() || '';
-            const isDocTrainer = Boolean(
-              currentUser && (
-                (normalizedDoc.trainerId && currentUser.uid === normalizedDoc.trainerId) ||
-                (normalizedDoc.trainerEmail && userEmailLower === normalizedDoc.trainerEmail.toLowerCase().trim()) ||
-                (userNameLower && normalizedDoc.trainerName && userNameLower === normalizedDoc.trainerName.toLowerCase().trim())
-              )
-            );
-            const isDocAttendee = Boolean(
-              currentUser && (normalizedDoc.attendees || []).some((a) =>
-                (a.employeeId && a.employeeId === currentUser.uid) ||
-                (a.email && userEmailLower === a.email.toLowerCase().trim())
-              )
+            const isDocTrainer = matchesTrainerUser(normalizedDoc, currentUser);
+            const isDocAttendee = (normalizedDoc.attendees || []).some((a) =>
+              matchesAttendeeUser(a, currentUser)
             );
             if (!canManageRegister && !isDocTrainer && !isDocAttendee) {
               setAccessDenied(true);
@@ -240,8 +255,61 @@ export default function TrainingRegisterDetail() {
               return;
             }
 
-            setFormData(normalizedDoc);
-            setInitialRegister(normalizedDoc);
+            // Record proof that trainer/attendee opened the Training Register on screen before signing
+            let registerToUse = normalizedDoc;
+            if (currentUser && normalizedDoc.workflowStatus !== 'draft' && (isDocTrainer || isDocAttendee)) {
+              const openKey = `${normalizedDoc.id}:${currentUser.uid}`;
+              const existingOpened = Array.isArray(normalizedDoc.openedBy) ? normalizedDoc.openedBy : [];
+              const alreadyRecorded = existingOpened.some(
+                (o) =>
+                  (o.uid && o.uid === currentUser.uid) ||
+                  (o.email && currentUser.email && o.email.toLowerCase().trim() === currentUser.email.toLowerCase().trim())
+              );
+
+              if (!alreadyRecorded && !recordedOpenKeysRef.current.has(openKey)) {
+                recordedOpenKeysRef.current.add(openKey);
+                const openRecord: TrainingRegisterOpenRecord = {
+                  uid: currentUser.uid,
+                  employeeId: currentUser.employeeId,
+                  name: currentUser.displayName || currentUser.email || 'Participant',
+                  email: currentUser.email || undefined,
+                  role: isDocTrainer ? 'trainer' : 'trainee',
+                  openedAt: new Date().toISOString()
+                };
+                const nextOpenedBy = [...existingOpened, openRecord];
+                registerToUse = { ...normalizedDoc, openedBy: nextOpenedBy };
+                try {
+                  await firestoreService.updateDocument('training_registers', normalizedDoc.id, {
+                    openedBy: nextOpenedBy
+                  });
+                  await firestoreService.logActivity(
+                    'Opened Training Register',
+                    'Training Registers',
+                    {
+                      id: normalizedDoc.id,
+                      registerId: normalizedDoc.id,
+                      title: normalizedDoc.trainingTitle,
+                      role: isDocTrainer ? 'Trainer' : 'Attendee',
+                      openedAt: openRecord.openedAt
+                    },
+                    currentUser.uid,
+                    currentUser.email,
+                    {
+                      entityType: 'training_register',
+                      entityId: normalizedDoc.id,
+                      entityTitle: normalizedDoc.trainingTitle || 'Training Register',
+                      when: 'When the Trainer or Attendee opened the Training Register on screen prior to signing',
+                      why: 'Mandatory access control check verifying the signer opened and reviewed the Training Register before signing'
+                    }
+                  );
+                } catch (openErr) {
+                  console.error('Failed to record register open event:', openErr);
+                }
+              }
+            }
+
+            setFormData(registerToUse);
+            setInitialRegister(registerToUse);
             if (doc.trainerName && !allUsers.some((u) => u.uid === doc.trainerId)) {
               setIsCustomTrainer(true);
             }
@@ -318,6 +386,7 @@ export default function TrainingRegisterDetail() {
     if (selectedUser) {
       updated[index] = {
         ...updated[index],
+        userId: selectedUser.uid,
         employeeId: selectedUser.employeeId || selectedUser.uid,
         traineeName: selectedUser.displayName,
         email: selectedUser.email,
@@ -327,6 +396,7 @@ export default function TrainingRegisterDetail() {
     } else {
       updated[index] = {
         ...updated[index],
+        userId: undefined,
         employeeId: undefined,
         traineeName: '',
         email: ''
@@ -430,11 +500,23 @@ export default function TrainingRegisterDetail() {
       let nextCurrentSignerIndex = formData.currentSignerIndex;
       let preparedAttendees = [...validAttendees];
 
-      // Re-number rows
-      preparedAttendees = preparedAttendees.map((a, i) => ({
-        ...a,
-        slNo: i + 1
-      }));
+      // Re-number rows and enrich attendee userId/email from registered users if matched
+      preparedAttendees = preparedAttendees.map((a, i) => {
+        const matched = users.find(
+          (u) =>
+            (a.userId && u.uid === a.userId) ||
+            (a.employeeId && (u.uid === a.employeeId || u.employeeId === a.employeeId)) ||
+            (a.email && u.email?.toLowerCase().trim() === a.email.toLowerCase().trim()) ||
+            (a.traineeName && u.displayName?.toLowerCase().trim() === a.traineeName.toLowerCase().trim())
+        );
+        return {
+          ...a,
+          slNo: i + 1,
+          userId: a.userId || matched?.uid,
+          employeeId: a.employeeId || matched?.employeeId || matched?.uid,
+          email: a.email || matched?.email || ''
+        };
+      });
 
       if (shouldLaunchWorkflow && formData.workflowStatus === 'draft') {
         nextStatus = 'in_progress';
@@ -516,7 +598,10 @@ export default function TrainingRegisterDetail() {
           {
             entityType: 'training_register',
             entityId: docId,
-            entityTitle: formData.trainingTitle || 'Training Register'
+            entityTitle: formData.trainingTitle || 'Training Register',
+            why: shouldLaunchWorkflow
+              ? 'Create a new Training Register and launch the sequential trainee-to-trainer signature workflow'
+              : 'Save a draft Training Register for configuration before starting the signing workflow'
           }
         );
       } else {
@@ -584,7 +669,10 @@ export default function TrainingRegisterDetail() {
             entityType: 'training_register',
             entityId: docId,
             entityTitle: formData.trainingTitle || 'Training Register',
-            changes: changes.length > 0 ? changes : undefined
+            changes: changes.length > 0 ? changes : undefined,
+            why: shouldLaunchWorkflow
+              ? 'Launch sequential attendance signature workflow and notify the first attendee'
+              : 'Update Training Register details or attendee records'
           }
         );
       }
@@ -594,10 +682,10 @@ export default function TrainingRegisterDetail() {
       setInitialRegister(updatedRegister);
       await loadRegisterAuditLogs(docId);
 
-      // If workflow was initiated, send email to Attendee 0
-      if (shouldLaunchWorkflow && preparedAttendees[0]?.email) {
+      // If workflow was initiated, notify Attendee #1 (service resolves UID + email from users collection)
+      if (shouldLaunchWorkflow && preparedAttendees[0]) {
         await trainingRegisterService.notifyAttendeeToSign(updatedRegister, preparedAttendees[0]);
-        toast.success(`Workflow started! Email invitation dispatched to ${preparedAttendees[0].traineeName}.`);
+        toast.success(`Workflow started! Invitation dispatched to ${preparedAttendees[0].traineeName}.`);
       } else {
         toast.success('Training Register saved successfully');
       }
@@ -632,7 +720,8 @@ export default function TrainingRegisterDetail() {
         {
           entityType: 'training_register',
           entityId: formData.id,
-          entityTitle: formData.trainingTitle || formData.id
+          entityTitle: formData.trainingTitle || formData.id,
+          why: 'Permanently delete a Training Register record'
         }
       );
       toast.success('Training Register deleted successfully', { id: toastId });
@@ -646,12 +735,36 @@ export default function TrainingRegisterDetail() {
     }
   };
 
-  // Open Signature Modal with strict authorization check
+  // Helper verifying the Training Register has been opened on screen and recorded
+  const ensureRegisterOpenedBeforeSign = (): boolean => {
+    if (!formData.id || isNew || formData.workflowStatus === 'draft') {
+      toast.error('Please start the signing workflow and open the saved Training Register before signing.');
+      return false;
+    }
+    if (!currentUser) return false;
+    const openedList = formData.openedBy || [];
+    const userOpened =
+      openedList.some(
+        (o) =>
+          (o.uid && o.uid === currentUser.uid) ||
+          (o.email && currentUser.email && o.email.toLowerCase().trim() === currentUser.email.toLowerCase().trim())
+      ) || recordedOpenKeysRef.current.has(`${formData.id}:${currentUser.uid}`);
+    if (!userOpened) {
+      toast.error('Training Register must be opened and reviewed before signing.');
+      return false;
+    }
+    return true;
+  };
+
+  // Open Signature Modal with strict authorization check, register-open check & mandatory doc review gate
   const openSignatureModal = (
     type: 'trainer' | 'trainee',
     attendeeIndex?: number,
     signerName: string = ''
   ) => {
+    if (!ensureRegisterOpenedBeforeSign()) return;
+    const requiresDocReview = formData.requireDocumentReview !== false;
+
     if (type === 'trainee') {
       const idx = attendeeIndex ?? formData.currentSignerIndex;
       const attendee = formData.attendees[idx];
@@ -660,31 +773,27 @@ export default function TrainingRegisterDetail() {
         return;
       }
 
-      // STRICT USER INTENT: "attendiees only allow own signature only dont allow to others signature"
-      const isOwn = Boolean(
-        currentUser && (
-          (attendee.employeeId && currentUser.uid === attendee.employeeId) ||
-          (attendee.email && currentUser.email?.toLowerCase().trim() === attendee.email.toLowerCase().trim())
-        )
-      );
-
-      if (!isOwn) {
+      if (!matchesAttendeeUser(attendee, currentUser)) {
         toast.error(`Permission Denied: Only ${attendee.traineeName || 'the assigned attendee'} can provide their own signature.`);
+        return;
+      }
+
+      if (requiresDocReview && !attendee.documentReviewed) {
+        setDocReviewModalOpen(true);
+        toast.info('Please review and confirm the Training Document / SOP before signing the Training Register.');
         return;
       }
     }
 
     if (type === 'trainer') {
-      const isTrainer = Boolean(
-        currentUser && (
-          (formData.trainerId && currentUser.uid === formData.trainerId) ||
-          (formData.trainerEmail && currentUser.email?.toLowerCase().trim() === formData.trainerEmail.toLowerCase().trim()) ||
-          (currentUser.displayName && formData.trainerName && currentUser.displayName.toLowerCase().trim() === formData.trainerName.toLowerCase().trim())
-        )
-      );
-
-      if (!isTrainer) {
+      if (!matchesTrainerUser(formData, currentUser)) {
         toast.error(`Permission Denied: Only the designated trainer (${formData.trainerName}) can sign as Trainer.`);
+        return;
+      }
+
+      if (requiresDocReview && !formData.trainerDocumentReviewed) {
+        setDocReviewModalOpen(true);
+        toast.info('Please review and confirm the Training Document / SOP before providing Trainer sign-off.');
         return;
       }
     }
@@ -729,21 +838,11 @@ export default function TrainingRegisterDetail() {
   const handleConfirmDocumentReview = async () => {
     if (!currentUser) return;
     const nowIso = new Date().toISOString();
-    const userEmailLower = currentUser.email?.toLowerCase().trim() || '';
-    const userNameLower = currentUser.displayName?.toLowerCase().trim() || '';
-
-    const isTrainerAccount = Boolean(
-      (formData.trainerId && currentUser.uid === formData.trainerId) ||
-      (formData.trainerEmail && userEmailLower === formData.trainerEmail.toLowerCase().trim()) ||
-      (userNameLower && formData.trainerName && userNameLower === formData.trainerName.toLowerCase().trim())
-    );
+    const isTrainerAccount = matchesTrainerUser(formData, currentUser);
 
     let matchedAttendeeUpdated = false;
     const updatedAttendees = formData.attendees.map((a) => {
-      const isOwnRow =
-        (a.employeeId && a.employeeId === currentUser.uid) ||
-        (a.email && userEmailLower === a.email.toLowerCase().trim());
-      if (isOwnRow) {
+      if (matchesAttendeeUser(a, currentUser)) {
         matchedAttendeeUpdated = true;
         return {
           ...a,
@@ -810,7 +909,8 @@ export default function TrainingRegisterDetail() {
           {
             entityType: 'training_register',
             entityId: nextRegister.id,
-            entityTitle: nextRegister.trainingTitle || 'Training Register'
+            entityTitle: nextRegister.trainingTitle || 'Training Register',
+            why: 'Mandatory SOP/Training Material review confirmation completed before capturing digital signature'
           }
         );
         await loadRegisterAuditLogs(nextRegister.id);
@@ -828,18 +928,11 @@ export default function TrainingRegisterDetail() {
   // Handle Signature Save (Sequential logic with strict authorization & mandatory document review)
   const handleSignatureCaptured = async (signatureDataUrl: string, formattedDate: string) => {
     if (!activeSignerTarget) return;
+    if (!ensureRegisterOpenedBeforeSign()) return;
     const requiresDocReview = formData.requireDocumentReview !== false;
 
     if (activeSignerTarget.type === 'trainer') {
-      const isTrainer = Boolean(
-        currentUser && (
-          (formData.trainerId && currentUser.uid === formData.trainerId) ||
-          (formData.trainerEmail && currentUser.email?.toLowerCase().trim() === formData.trainerEmail.toLowerCase().trim()) ||
-          (currentUser.displayName && formData.trainerName && currentUser.displayName.toLowerCase().trim() === formData.trainerName.toLowerCase().trim())
-        )
-      );
-
-      if (!isTrainer) {
+      if (!matchesTrainerUser(formData, currentUser)) {
         toast.error('Unauthorized: Only the designated trainer can sign this sign-off.');
         return;
       }
@@ -914,7 +1007,8 @@ export default function TrainingRegisterDetail() {
           entityType: 'training_register',
           entityId: updatedRegister.id,
           entityTitle: updatedRegister.trainingTitle || 'Training Register',
-          changes: [{ field: 'Workflow Status', from: 'awaiting_trainer', to: 'completed' }]
+          changes: [{ field: 'Workflow Status', from: 'awaiting_trainer', to: 'completed' }],
+          why: 'Trainer provided final closing sign-off after verifying all attendee signatures and reviewing the training document'
         }
       );
       await loadRegisterAuditLogs(updatedRegister.id);
@@ -936,14 +1030,7 @@ export default function TrainingRegisterDetail() {
     if (idx === undefined || idx === null) return;
 
     const attendee = formData.attendees[idx];
-    const isOwn = Boolean(
-      currentUser && (
-        (attendee.employeeId && currentUser.uid === attendee.employeeId) ||
-        (attendee.email && currentUser.email?.toLowerCase().trim() === attendee.email.toLowerCase().trim())
-      )
-    );
-
-    if (!isOwn) {
+    if (!matchesAttendeeUser(attendee, currentUser)) {
       toast.error('Unauthorized: Attendees are only allowed to provide their own signature.');
       return;
     }
@@ -1045,24 +1132,20 @@ export default function TrainingRegisterDetail() {
         changes: [
           { field: `Attendee #${attendee.slNo} (${attendee.traineeName})`, from: 'pending', to: 'signed' },
           ...(nextStatus !== formData.workflowStatus ? [{ field: 'Workflow Status', from: formData.workflowStatus, to: nextStatus }] : [])
-        ]
+        ],
+        why: 'Attendee opened the Training Register, reviewed the material, and captured their sequential attendance signature'
       }
     );
     await loadRegisterAuditLogs(updatedRegister.id);
 
-    // Send email to next attendee or to trainer
+    // Send notification & email to next attendee or to trainer (service resolves UID & email reliably)
     if (nextIndex < updatedAttendees.length) {
       const nextAttendee = updatedAttendees[nextIndex];
-      if (nextAttendee.email) {
-        await trainingRegisterService.notifyAttendeeToSign(updatedRegister, nextAttendee);
-        toast.info(`Email invitation dispatched to next attendee: ${nextAttendee.traineeName}`);
-      }
+      await trainingRegisterService.notifyAttendeeToSign(updatedRegister, nextAttendee);
+      toast.info(`Notification dispatched to next attendee: ${nextAttendee.traineeName}`);
     } else {
-      // All attendees finished -> trigger email to Trainer!
-      if (updatedRegister.trainerEmail) {
-        await trainingRegisterService.notifyTrainerToSign(updatedRegister);
-        toast.info(`Email invitation sent to Trainer: ${updatedRegister.trainerName}`);
-      }
+      await trainingRegisterService.notifyTrainerToSign(updatedRegister);
+      toast.info(`Notification sent to Trainer: ${updatedRegister.trainerName}`);
     }
   };
 
@@ -1085,7 +1168,8 @@ export default function TrainingRegisterDetail() {
           {
             entityType: 'training_register',
             entityId: formData.id,
-            entityTitle: formData.trainingTitle || 'Training Register'
+            entityTitle: formData.trainingTitle || 'Training Register',
+            why: 'Export official Training Register compliance PDF for audit or archival'
           }
         );
         await loadRegisterAuditLogs(formData.id);
@@ -1101,12 +1185,7 @@ export default function TrainingRegisterDetail() {
 
   // Check if current user is the current eligible signer
   const currentAttendee = formData.attendees[formData.currentSignerIndex];
-  const isAttendeeSelf = Boolean(
-    currentUser && currentAttendee && (
-      (currentAttendee.employeeId && currentUser.uid === currentAttendee.employeeId) ||
-      (currentAttendee.email && currentUser.email?.toLowerCase().trim() === currentAttendee.email.toLowerCase().trim())
-    )
-  );
+  const isAttendeeSelf = Boolean(currentAttendee && matchesAttendeeUser(currentAttendee, currentUser));
 
   // STRICT: Only attendee's OWN account can sign attendee row! Admin/HR cannot sign for attendees.
   const isCurrentSigner =
@@ -1114,42 +1193,33 @@ export default function TrainingRegisterDetail() {
     currentAttendee?.status === 'pending' &&
     isAttendeeSelf;
 
-  const isTrainerSelf = Boolean(
-    currentUser && (
-      (formData.trainerId && currentUser.uid === formData.trainerId) ||
-      (formData.trainerEmail && currentUser.email?.toLowerCase().trim() === formData.trainerEmail.toLowerCase().trim()) ||
-      (currentUser.displayName && formData.trainerName && currentUser.displayName.toLowerCase().trim() === formData.trainerName.toLowerCase().trim())
-    )
-  );
+  const isTrainerSelf = matchesTrainerUser(formData, currentUser);
 
   const isTrainerSigner =
     formData.workflowStatus === 'awaiting_trainer' &&
     isTrainerSelf;
 
   const canEditRegister = Boolean(canManageRegister || isTrainerSelf);
-  const currentUserAttendeeRow = formData.attendees.find((a) =>
-    Boolean(
-      currentUser && (
-        (a.employeeId && currentUser.uid === a.employeeId) ||
-        (a.email && currentUser.email?.toLowerCase().trim() === a.email.toLowerCase().trim())
-      )
-    )
-  );
+  const currentUserAttendeeRow = formData.attendees.find((a) => matchesAttendeeUser(a, currentUser));
   const currentUserHasReviewedDoc = isTrainerSelf
     ? Boolean(formData.trainerDocumentReviewed)
     : Boolean(currentUserAttendeeRow?.documentReviewed);
 
-  // Auto-open signature modal if landing via notification or email link (?sign=...)
+  // When landing via notification or email link, require opening & reviewing the register first (do NOT auto-pop signature pad)
   useEffect(() => {
-    if (loading || !formData.id || autoPrompted || signatureModalOpen) return;
+    if (loading || !formData.id || autoPrompted) return;
 
     const signParam = searchParams.get('sign');
-    if (!signParam) return;
+    if (!signParam && !(isCurrentSigner || isTrainerSigner)) return;
 
+    setAutoPrompted(true);
     if (signParam === 'trainee' || signParam === '1' || signParam === 'true') {
       if (isCurrentSigner && currentAttendee) {
-        setAutoPrompted(true);
-        openSignatureModal('trainee', formData.currentSignerIndex, currentAttendee.traineeName);
+        setRegisterOpenedBanner(
+          currentAttendee.documentReviewed
+            ? 'Training Register opened. Your document review is confirmed — please review the register details and click Sign when ready.'
+            : 'Training Register opened. Please read the register details and confirm the Training Document review before signing.'
+        );
       } else if (formData.workflowStatus === 'in_progress' && !isCurrentSigner) {
         toast.info(
           `Currently awaiting Attendee #${formData.currentSignerIndex + 1}: ${
@@ -1159,13 +1229,16 @@ export default function TrainingRegisterDetail() {
       }
     } else if (signParam === 'trainer') {
       if (isTrainerSigner) {
-        setAutoPrompted(true);
-        openSignatureModal('trainer', undefined, formData.trainerName);
+        setRegisterOpenedBanner(
+          formData.trainerDocumentReviewed
+            ? 'Training Register opened. Review attendee sign-offs below and click Sign as Trainer when ready.'
+            : 'Training Register opened. Please review attendee records and confirm the Training Document review before Trainer sign-off.'
+        );
       } else if (formData.workflowStatus !== 'awaiting_trainer') {
         toast.info('Training register is not yet ready for trainer sign-off (attendees are still signing).');
       }
     }
-  }, [loading, formData.id, formData.workflowStatus, formData.currentSignerIndex, isCurrentSigner, isTrainerSigner, searchParams, autoPrompted, signatureModalOpen, currentAttendee]);
+  }, [loading, formData.id, formData.workflowStatus, formData.currentSignerIndex, isCurrentSigner, isTrainerSigner, searchParams, autoPrompted, currentAttendee, formData.trainerDocumentReviewed]);
 
   if (loading) {
     return (
@@ -1305,6 +1378,24 @@ export default function TrainingRegisterDetail() {
           )}
         </div>
       </div>
+
+      {/* Register Opened Review Banner */}
+      {registerOpenedBanner && (
+        <div className="bg-indigo-50 border border-indigo-200 text-indigo-900 px-4 py-3 rounded-2xl flex items-center justify-between gap-3 text-xs">
+          <div className="flex items-center gap-2.5">
+            <FileCheck2 className="w-4 h-4 text-indigo-600 shrink-0" />
+            <span className="font-medium">{registerOpenedBanner}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setRegisterOpenedBanner(null)}
+            className="text-indigo-700 hover:text-indigo-950 p-1"
+            title="Dismiss"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Workflow Status Banner */}
       {formData.workflowStatus === 'in_progress' && (
@@ -1688,7 +1779,8 @@ export default function TrainingRegisterDetail() {
                                   documentVersion: t.version || prev.documentVersion
                                 }));
                                 setIsTemplateDropdownOpen(false);
-                                toast.success(`Template selected: "${t.name}" (${t.version || 'V1.0'})`);
+                                const ver = formatQuestionnaireVersion(t.version);
+                                toast.success(`Template selected: "${t.name}"${ver ? ` (${ver})` : ''}`);
                               }}
                               className="w-full text-left p-2.5 hover:bg-accent transition-colors flex items-center justify-between group"
                             >
@@ -1697,9 +1789,11 @@ export default function TrainingRegisterDetail() {
                                   <p className="text-xs font-bold text-foreground group-hover:text-primary transition-colors">
                                     {t.name}
                                   </p>
-                                  <span className="px-1.5 py-0.5 bg-primary/10 text-primary rounded text-[10px] font-mono font-bold">
-                                    {t.version || 'V1.0'}
-                                  </span>
+                                  {formatQuestionnaireVersion(t.version) && (
+                                    <span className="px-1.5 py-0.5 bg-primary/10 text-primary rounded text-[10px] font-mono font-bold">
+                                      {formatQuestionnaireVersion(t.version)}
+                                    </span>
+                                  )}
                                 </div>
                                 <p className="text-[11px] text-muted-foreground">
                                   {t.skillCategory || 'General'} • {t.questions?.length || 0} Questions • Pass {t.passMark || 80}%
@@ -2006,12 +2100,8 @@ export default function TrainingRegisterDetail() {
               </thead>
               <tbody className="divide-y-2 divide-foreground/80">
                 {formData.attendees.map((attendee, index) => {
-                  const isOwnSignature = Boolean(
-                    currentUser && (
-                      (attendee.employeeId && currentUser.uid === attendee.employeeId) ||
-                      (attendee.email && currentUser.email?.toLowerCase().trim() === attendee.email.toLowerCase().trim())
-                    )
-                  );
+                  const isOwnSignature = matchesAttendeeUser(attendee, currentUser);
+                  const matchedSelectUser = users.find((u) => matchesAttendeeUser(attendee, u));
 
                   // STRICT: Attendees only allow own signature only! No one else can sign on their behalf.
                   const isEligibleToSign =
@@ -2057,7 +2147,7 @@ export default function TrainingRegisterDetail() {
                             <div className="flex flex-col sm:flex-row items-center gap-2">
                               {/* Option 1: Pick from registered users */}
                               <select
-                                value={attendee.employeeId || ''}
+                                value={attendee.userId || matchedSelectUser?.uid || ''}
                                 onChange={(e) => handleTraineeSelect(index, e.target.value)}
                                 className="w-full sm:w-1/2 px-2.5 py-1.5 bg-background border rounded-md text-xs font-medium outline-none focus:ring-1 focus:ring-primary"
                               >
@@ -2265,7 +2355,10 @@ export default function TrainingRegisterDetail() {
                     {formData.documentTitle || formData.trainingTitle || 'Training Document Review'}
                   </h3>
                   <p className="text-xs text-muted-foreground font-mono">
-                    {formData.documentCode || formData.templateDocCode || 'SOP'} • Version {formData.documentVersion || formData.templateVersion || 'V1.0'}
+                    {formData.documentCode || formData.templateDocCode || 'SOP'}
+                    {formatQuestionnaireVersion(formData.documentVersion || formData.templateVersion)
+                      ? ` • Version ${formatQuestionnaireVersion(formData.documentVersion || formData.templateVersion)}`
+                      : ''}
                   </p>
                 </div>
               </div>

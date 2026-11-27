@@ -25,12 +25,12 @@ import {
   Users
 } from 'lucide-react';
 import { toast } from 'sonner';
-import { cn, formatDate, formatDateTime, formatSignatureDate, formatId } from '../lib/utils';
+import { cn, formatAuditTimestamp, formatDate, formatDateTime, formatSignatureDate, formatId, formatQuestionnaireVersion, normalizeSyMetricText } from '../lib/utils';
 import { jsPDF } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import * as XLSX from 'xlsx';
 import { useAuth } from '../contexts/AuthContext';
-import { firestoreService, where, inferAuditEntityType } from '../services/firestoreService';
+import { firestoreService, where, inferAuditEntityType, AuditEntityCategory } from '../services/firestoreService';
 import { trainingRegisterService } from '../services/trainingRegisterService';
 import { Submission, Evaluation, Template, Assignment, User as UserType, Department, TrainingRegister, TrainingRegisterTemplateConfig, AuditLog } from '../types';
 import { BrandLogo } from '../components/BrandLogo';
@@ -38,6 +38,8 @@ import { drawPdfBrandingHeader, sanitizeReportBrandName } from '../utils/pdfBran
 import { AuditLifecyclePanel, SingleActivityDetailCard } from '../components/AuditLifecyclePanel';
 import {
   buildEvaluationReportLifecycle,
+  buildGenericEntityLifecycle,
+  buildTemplateLifecycle,
   buildTrainingRegisterLifecycle,
   EnrichedAuditLog,
   enrichAuditLogEntry,
@@ -46,6 +48,7 @@ import {
   LifecycleReportSummary,
   matchesSubmissionOrAssignmentLog
 } from '../utils/auditLifecycle';
+import { generateAuditLogsListPdf, generateFinalAuditReportPdf } from '../utils/finalAuditReportPdf';
 
 export default function Reports() {
   const { user: currentUser, branding } = useAuth();
@@ -78,6 +81,9 @@ export default function Reports() {
   const [auditDepartments, setAuditDepartments] = useState<Department[]>([]);
   const [auditTemplateConfig, setAuditTemplateConfig] = useState<TrainingRegisterTemplateConfig | null>(null);
   const [selectedReportAuditLog, setSelectedReportAuditLog] = useState<EnrichedAuditLog | null>(null);
+  const [exportingAuditPdf, setExportingAuditPdf] = useState(false);
+  const [auditModalSummary, setAuditModalSummary] = useState<LifecycleReportSummary | null>(null);
+  const [auditModalLoading, setAuditModalLoading] = useState(false);
 
   // User Summary Report State
   const [summaryUserId, setSummaryUserId] = useState<string>('all');
@@ -107,6 +113,10 @@ export default function Reports() {
       status: 'Pass' | 'Fail' | 'Pending Review' | 'In Progress' | 'Not Started';
       reviewer: string;
       employeeName?: string;
+      submissionId?: string;
+      assignmentId?: string;
+      templateId?: string;
+      employeeUid?: string;
     }>;
   } | null>(null);
 
@@ -169,10 +179,11 @@ export default function Reports() {
         const emp = allUsers.find(u => u.uid === sub.employeeId);
         const assign = allAssigns.find(a => a.id === sub.assignmentId);
         const tmpl = allTemps.find(t => t.id === (sub.templateId || assign?.templateId));
+        const tmplVer = formatQuestionnaireVersion(tmpl?.version);
         entityMap.set(sub.id, {
           id: sub.id,
           type: 'assessment_report',
-          label: `Evaluation Report: ${emp?.displayName || sub.employeeId} - ${tmpl?.name || 'Assessment'} (${tmpl?.version || 'V1.0'})`
+          label: `Evaluation Report: ${emp?.displayName || sub.employeeId} - ${tmpl?.name || 'Assessment'}${tmplVer ? ` (${tmplVer})` : ''}`
         });
       }
 
@@ -182,6 +193,29 @@ export default function Reports() {
           type: 'training_register',
           label: `Training Register: ${reg.trainingTitle || reg.id} (${reg.date})`
         });
+      }
+
+      for (const tmpl of allTemps) {
+        if (!entityMap.has(tmpl.id)) {
+          const tmplVer = formatQuestionnaireVersion(tmpl.version);
+          entityMap.set(tmpl.id, {
+            id: tmpl.id,
+            type: 'template',
+            label: `Questionnaire Template: ${tmpl.name}${tmplVer ? ` (${tmplVer})` : ''}`
+          });
+        }
+      }
+
+      for (const assign of allAssigns) {
+        if (!entityMap.has(assign.id)) {
+          const tmpl = allTemps.find(t => t.id === assign.templateId);
+          const tmplVer = formatQuestionnaireVersion(tmpl?.version);
+          entityMap.set(assign.id, {
+            id: assign.id,
+            type: 'assignment',
+            label: `Assignment: ${tmpl?.name || assign.templateId}${tmplVer ? ` (${tmplVer})` : ''} (${formatDate(assign.createdAt || assign.startDate)})`
+          });
+        }
       }
 
       for (const log of sortedLogs) {
@@ -304,7 +338,7 @@ export default function Reports() {
             evalData ? evalData.finalScore.toFixed(1) : '-',
             evalData?.result || 'Pending',
             reviewer?.displayName === 'System Admin' ? (user?.displayName || 'Super Admin') : (reviewer?.displayName || '-'),
-            { type: 'action', submissionId: s.id, disabled: !evalData }
+            { type: 'action', submissionId: s.id, assignmentId: s.assignmentId, disabled: !evalData }
           ];
         });
       } else if (reportType === 'Department Report') {
@@ -533,7 +567,7 @@ export default function Reports() {
       // Assessment Info
       const trainerName = reviewer?.displayName === 'System Admin' ? (user?.displayName || 'Super Admin') : (reviewer?.displayName || 'N/A');
       doc.text(`SOP Name: ${template?.name || 'N/A'}`, 110, infoStartY);
-      doc.text(`SOP Version: ${template?.version || 'V1.0'}`, 110, infoStartY + 6);
+      doc.text(`SOP Version: ${formatQuestionnaireVersion(template?.version) || '—'}`, 110, infoStartY + 6);
       doc.text(`Trainer Name: ${trainerName}`, 110, infoStartY + 12);
       doc.text(`Submitted At: ${formatDateTime(submission.submittedAt)}`, 110, infoStartY + 18);
       doc.text(`Duration: ${Math.floor(submission.durationTaken / 60)}m ${submission.durationTaken % 60}s`, 110, infoStartY + 24);
@@ -617,18 +651,22 @@ export default function Reports() {
       const finalY = (doc as any).lastAutoTable.finalY + 10;
 
       // Reviewer Comments
-      if (finalY < 240) {
+      const reviewerDisplay = reviewer?.displayName === 'System Admin' ? (user?.displayName || 'Super Admin') : (reviewer?.displayName || 'Unknown');
+      const commentText = `Overall Comments: ${evaluation.overallComments || 'None'}`;
+      const splitComment = doc.splitTextToSize(commentText, 180);
+      const commentBlockHeight = Math.max(8, splitComment.length * 5);
+
+      if (finalY + commentBlockHeight + 45 < 275) {
         doc.setFontSize(12);
         doc.text('Reviewer Feedback', 14, finalY);
         doc.setFontSize(10);
-        doc.text(`Overall Comments: ${evaluation.overallComments || 'None'}`, 14, finalY + 8);
-        doc.text(`Strengths: ${evaluation.strengths || 'None'}`, 14, finalY + 16);
-        doc.text(`Areas for Improvement: ${evaluation.improvements || 'None'}`, 14, finalY + 24);
-        doc.text(`Reviewer: ${reviewer?.displayName === 'System Admin' ? (user?.displayName || 'Super Admin') : (reviewer?.displayName || 'Unknown')}`, 14, finalY + 32);
-        
+        doc.text(splitComment, 14, finalY + 8);
+        const reviewerY = finalY + 8 + commentBlockHeight + 2;
+        doc.text(`Reviewer: ${reviewerDisplay}`, 14, reviewerY);
+
         // Digital Signatures
-        const sigY = finalY + 60;
-        
+        const sigY = reviewerY + 26;
+
         // Employee Signature
         doc.setDrawColor(200);
         doc.line(14, sigY, 90, sigY);
@@ -641,9 +679,8 @@ export default function Reports() {
         doc.setFontSize(8);
         doc.text('Employee Digital Signature', 14, sigY + 5);
         doc.text(`Date & Time: ${formatSignatureDate(submission.submittedAt)}`, 14, sigY + 10);
-        
+
         // Reviewer Signature
-        const reviewerDisplay = reviewer?.displayName === 'System Admin' ? (user?.displayName || 'Super Admin') : (reviewer?.displayName || 'Unknown');
         doc.line(110, sigY, 186, sigY);
         doc.setTextColor(primaryColor);
         doc.setFont('helvetica', 'italic');
@@ -658,13 +695,12 @@ export default function Reports() {
         doc.setFontSize(12);
         doc.text('Reviewer Feedback', 14, 20);
         doc.setFontSize(10);
-        doc.text(`Overall Comments: ${evaluation.overallComments || 'None'}`, 14, 28);
-        doc.text(`Strengths: ${evaluation.strengths || 'None'}`, 14, 36);
-        doc.text(`Areas for Improvement: ${evaluation.improvements || 'None'}`, 14, 44);
-        doc.text(`Reviewer: ${reviewer?.displayName === 'System Admin' ? (user?.displayName || 'Super Admin') : (reviewer?.displayName || 'Unknown')}`, 14, 52);
+        doc.text(splitComment, 14, 28);
+        const reviewerY = 28 + commentBlockHeight + 2;
+        doc.text(`Reviewer: ${reviewerDisplay}`, 14, reviewerY);
 
         // Digital Signatures on new page
-        const sigY = 80;
+        const sigY = reviewerY + 26;
         // Employee Signature
         doc.setDrawColor(200);
         doc.line(14, sigY, 90, sigY);
@@ -677,9 +713,8 @@ export default function Reports() {
         doc.setFontSize(8);
         doc.text('Employee Digital Signature', 14, sigY + 5);
         doc.text(`Date & Time: ${formatSignatureDate(submission.submittedAt)}`, 14, sigY + 10);
-        
+
         // Reviewer Signature
-        const reviewerDisplay = reviewer?.displayName === 'System Admin' ? (user?.displayName || 'Super Admin') : (reviewer?.displayName || 'Unknown');
         doc.line(110, sigY, 186, sigY);
         doc.setTextColor(primaryColor);
         doc.setFont('helvetica', 'italic');
@@ -712,6 +747,102 @@ export default function Reports() {
       toast.error(error.message || 'Failed to download evaluation report.');
     } finally {
       setExporting(false);
+    }
+  };
+
+  const buildRowAuditSummary = async (params: {
+    submissionId?: string;
+    assignmentId?: string;
+    templateId?: string;
+    employeeUid?: string;
+  }): Promise<LifecycleReportSummary | null> => {
+    const [allSubs, allAssigns, allEvals, allTemps, allUsers, allDepts, allLogs, tmplCfg] = await Promise.all([
+      firestoreService.getCollection<Submission>('submissions'),
+      firestoreService.getCollection<Assignment>('assignments'),
+      firestoreService.getCollection<Evaluation>('reviews'),
+      firestoreService.getCollection<Template>('templates'),
+      users.length > 0 ? Promise.resolve(users) : firestoreService.getCollection<UserType>('users'),
+      departments.length > 0 ? Promise.resolve(departments) : firestoreService.getCollection<Department>('departments'),
+      firestoreService.getCollection<AuditLog>('auditLogs'),
+      trainingRegisterService.getTemplateConfig().catch(() => null)
+    ]);
+
+    const submission = params.submissionId
+      ? allSubs.find(s => s.id === params.submissionId) || null
+      : params.assignmentId
+      ? allSubs.find(s => s.assignmentId === params.assignmentId && (!params.employeeUid || s.employeeId === params.employeeUid)) || null
+      : null;
+    const assignment = params.assignmentId
+      ? allAssigns.find(a => a.id === params.assignmentId) || null
+      : submission?.assignmentId
+      ? allAssigns.find(a => a.id === submission.assignmentId) || null
+      : null;
+    const evaluation = submission
+      ? allEvals.find(e => e.submissionId === submission.id) || null
+      : null;
+    const templateId = submission?.templateId || assignment?.templateId || params.templateId;
+    const template = templateId ? allTemps.find(t => t.id === templateId) || null : null;
+
+    if (submission || assignment) {
+      return buildEvaluationReportLifecycle({
+        submission,
+        assignment,
+        evaluation,
+        template,
+        users: allUsers,
+        departments: allDepts,
+        logs: allLogs,
+        templateConfig: tmplCfg
+      });
+    }
+    if (template) {
+      return buildTemplateLifecycle({ template, users: allUsers, logs: allLogs });
+    }
+    return null;
+  };
+
+  const openRowAuditReport = async (params: {
+    submissionId?: string;
+    assignmentId?: string;
+    templateId?: string;
+    employeeUid?: string;
+  }) => {
+    setAuditModalLoading(true);
+    try {
+      const summary = await buildRowAuditSummary(params);
+      if (!summary) {
+        toast.error('No audit trail records found for this report.');
+        return;
+      }
+      setAuditModalSummary(summary);
+    } catch (err) {
+      console.error('Failed to load report audit trail:', err);
+      toast.error('Failed to load Final Audit Report.');
+    } finally {
+      setAuditModalLoading(false);
+    }
+  };
+
+  const downloadRowAuditReportPdf = async (params: {
+    submissionId?: string;
+    assignmentId?: string;
+    templateId?: string;
+    employeeUid?: string;
+  }) => {
+    setExportingAuditPdf(true);
+    try {
+      const summary = await buildRowAuditSummary(params);
+      if (!summary) {
+        toast.error('No audit trail records found for this report.');
+        return;
+      }
+      await generateFinalAuditReportPdf(summary, branding);
+      toast.success('Final Audit Report PDF downloaded');
+    } catch (err) {
+      console.error('Failed to generate Final Audit Report PDF:', err);
+      toast.error('Failed to generate Final Audit Report PDF.');
+    } finally {
+      setExportingAuditPdf(false);
     }
   };
 
@@ -945,6 +1076,10 @@ export default function Reports() {
         status: 'Pass' | 'Fail' | 'Pending Review' | 'In Progress' | 'Not Started';
         reviewer: string;
         employeeName?: string;
+        submissionId?: string;
+        assignmentId?: string;
+        templateId?: string;
+        employeeUid?: string;
       }> = [];
 
       let totalAssigned = 0;
@@ -1013,7 +1148,11 @@ export default function Reports() {
             score: scoreStr,
             status,
             reviewer: reviewer?.displayName || 'Assigned Reviewer',
-            employeeName: u.displayName
+            employeeName: u.displayName,
+            submissionId: userSub?.id,
+            assignmentId: assign.id,
+            templateId: assign.templateId,
+            employeeUid: u.uid
           });
         }
       }
@@ -1491,6 +1630,7 @@ export default function Reports() {
                         <th className="py-3 px-4 text-center">Score</th>
                         <th className="py-3 px-4 text-center">Result</th>
                         <th className="py-3 px-4">Assigned Reviewer</th>
+                        <th className="py-3 px-4 text-right whitespace-nowrap">Audit Report</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y text-xs">
@@ -1525,11 +1665,48 @@ export default function Reports() {
                               </span>
                             </td>
                             <td className="py-3 px-4 text-muted-foreground">{item.reviewer}</td>
+                            <td className="py-3 px-4 text-right whitespace-nowrap">
+                              <div className="inline-flex items-center justify-end gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    openRowAuditReport({
+                                      submissionId: item.submissionId,
+                                      assignmentId: item.assignmentId,
+                                      templateId: item.templateId,
+                                      employeeUid: item.employeeUid
+                                    })
+                                  }
+                                  disabled={auditModalLoading}
+                                  className="px-2.5 py-1 border rounded-md text-[11px] font-bold text-primary hover:bg-primary/10 transition-colors inline-flex items-center gap-1 whitespace-nowrap shrink-0"
+                                  title="View Final Audit Report (Changes & Activities)"
+                                >
+                                  <History className="w-3.5 h-3.5" />
+                                  <span>Audit Trail</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    downloadRowAuditReportPdf({
+                                      submissionId: item.submissionId,
+                                      assignmentId: item.assignmentId,
+                                      templateId: item.templateId,
+                                      employeeUid: item.employeeUid
+                                    })
+                                  }
+                                  disabled={exportingAuditPdf}
+                                  className="p-1.5 border rounded-md text-sky-700 hover:bg-sky-50 transition-colors shrink-0"
+                                  title="Download Final Audit Report PDF"
+                                >
+                                  <FileText className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </td>
                           </tr>
                         ))
                       ) : (
                         <tr>
-                          <td colSpan={summaryUserId === 'all' ? 9 : 8} className="py-12 text-center text-muted-foreground">
+                          <td colSpan={summaryUserId === 'all' ? 10 : 9} className="py-12 text-center text-muted-foreground">
                             <div className="flex flex-col items-center justify-center gap-2">
                               <ClipboardList className="w-8 h-8 text-muted-foreground/40" />
                               <p className="font-semibold">No training or assessment records found.</p>
@@ -1688,6 +1865,23 @@ export default function Reports() {
       ) : (
         /* Report-Wise Audit Trail Tab */
         (() => {
+          const categoryCounts = {
+            all: reportEntityOptions.length,
+            training_register: reportEntityOptions.filter(o => o.type === 'training_register').length,
+            assessment_report: reportEntityOptions.filter(o => o.type === 'assessment_report').length,
+            assignment: reportEntityOptions.filter(o => o.type === 'assignment').length,
+            template: reportEntityOptions.filter(o => o.type === 'template').length,
+            system: reportEntityOptions.filter(o => o.type === 'system').length
+          };
+
+          const reportCategoryGroups = [
+            { key: 'training_register', label: 'Training Registers' },
+            { key: 'assessment_report', label: 'Assessment / Evaluation Reports' },
+            { key: 'assignment', label: 'Assessments / Assignments' },
+            { key: 'template', label: 'Questionnaire Templates' },
+            { key: 'system', label: 'System / Auth & Other Reports' }
+          ] as const;
+
           const filteredEntities = reportEntityOptions.filter(opt =>
             auditCategoryFilter === 'all' ? true : opt.type === auditCategoryFilter
           );
@@ -1701,6 +1895,10 @@ export default function Reports() {
 
           const selectedAssignment = selectedAuditEntityId !== 'all'
             ? auditAssignments.find(a => a.id === selectedAuditEntityId)
+            : undefined;
+
+          const selectedTemplate = selectedAuditEntityId !== 'all'
+            ? auditTemplates.find(t => t.id === selectedAuditEntityId)
             : undefined;
 
           let selectedLifecycleSummary: LifecycleReportSummary | null = null;
@@ -1739,6 +1937,30 @@ export default function Reports() {
               logs: auditLogs,
               templateConfig: auditTemplateConfig
             });
+          } else if (selectedTemplate) {
+            selectedLifecycleSummary = buildTemplateLifecycle({
+              template: selectedTemplate,
+              users: auditUsers,
+              logs: auditLogs
+            });
+          } else if (selectedAuditEntityId !== 'all') {
+            const matchedOpt = reportEntityOptions.find(o => o.id === selectedAuditEntityId);
+            selectedLifecycleSummary = buildGenericEntityLifecycle({
+              entityType: (matchedOpt?.type || 'system') as AuditEntityCategory,
+              entityId: selectedAuditEntityId,
+              entityTitle: matchedOpt?.label || selectedAuditEntityId,
+              logs: auditLogs,
+              users: auditUsers,
+              context: {
+                submissions: auditSubmissions,
+                assignments: auditAssignments,
+                evaluations: auditEvaluations,
+                registers: auditRegisters,
+                templates: auditTemplates,
+                departments: auditDepartments,
+                templateConfig: auditTemplateConfig
+              }
+            });
           }
 
           const enrichedLogs = auditLogs.map(l =>
@@ -1774,11 +1996,51 @@ export default function Reports() {
               const involvedText = log.involvedParties
                 .map(p => `${p.roleInActivity} ${p.name} ${p.email || ''} ${p.employeeId || ''}`)
                 .join(' ');
-              const hay = `${log.stage} ${log.action} ${log.module} ${resolvedType} ${log.entityTitle || ''} ${log.entityId || ''} ${log.actor.name} ${log.actor.email} ${log.actor.employeeId || ''} ${log.actor.role || ''} ${involvedText} ${log.notifiedOnFinish.join(' ')} ${log.nextAfterFinish} ${JSON.stringify(log.details || {})} ${JSON.stringify(log.changes || [])}`.toLowerCase();
+              const hay = `${log.stage} ${log.when} ${log.why} ${log.action} ${log.module} ${resolvedType} ${log.entityTitle || ''} ${log.entityId || ''} ${log.actor.name} ${log.actor.email} ${log.actor.employeeId || ''} ${log.actor.role || ''} ${involvedText} ${log.notifiedOnFinish.join(' ')} ${log.nextAfterFinish} ${JSON.stringify(log.details || {})} ${JSON.stringify(log.changes || [])}`.toLowerCase();
               if (!hay.includes(q)) return false;
             }
             return true;
           });
+
+          const handleExportAuditPdf = async () => {
+            if (selectedLifecycleSummary) {
+              setExportingAuditPdf(true);
+              try {
+                await generateFinalAuditReportPdf(selectedLifecycleSummary, branding);
+                toast.success('Final Audit Report PDF downloaded');
+              } catch (err) {
+                console.error('Error generating Final Audit Report PDF:', err);
+                toast.error('Failed to generate Final Audit Report PDF');
+              } finally {
+                setExportingAuditPdf(false);
+              }
+              return;
+            }
+            if (filteredAuditLogs.length === 0) {
+              toast.error('No audit trail entries to export.');
+              return;
+            }
+            setExportingAuditPdf(true);
+            try {
+              const activeCategoryLabel =
+                reportCategoryGroups.find(c => c.key === auditCategoryFilter)?.label || 'Report-Wise Audit Trail';
+              await generateAuditLogsListPdf(
+                filteredAuditLogs,
+                `${auditCategoryFilter === 'all' ? 'All Reports Audit Trail' : activeCategoryLabel} — Final Audit Report`,
+                branding,
+                {
+                  filenamePrefix: `report_audit_${auditCategoryFilter}_final_report`,
+                  status: `${filteredAuditLogs.length} Audited Event${filteredAuditLogs.length === 1 ? '' : 's'}`
+                }
+              );
+              toast.success('Final Audit Report PDF downloaded');
+            } catch (err) {
+              console.error('Error generating Final Audit Report PDF:', err);
+              toast.error('Failed to generate Final Audit Report PDF');
+            } finally {
+              setExportingAuditPdf(false);
+            }
+          };
 
           const handleExportAuditCsv = () => {
             if (filteredAuditLogs.length === 0) {
@@ -1786,16 +2048,19 @@ export default function Reports() {
               return;
             }
             const headers = [
+              'Step',
+              'Stage',
               'Timestamp',
-              'Lifecycle Stage',
+              'When (Timing / Context)',
               'Report / Entity Type',
               'Report / Entity ID',
               'Report Title',
               'Action',
+              'Why Action Was Performed',
               'Initiated By',
-              'Performed By Name',
+              'Performed By (Name)',
               'Performed By Employee ID',
-              'Performed By Email',
+              'Performed By Email ID',
               'Performed By Role',
               'All Involved in Activity',
               'Notified When Finished',
@@ -1805,27 +2070,30 @@ export default function Reports() {
             ];
             const csv = [
               headers.join(','),
-              ...filteredAuditLogs.map(l => {
+              ...filteredAuditLogs.map((l, idx) => {
                 const involved = l.involvedParties
                   .map(p => `${p.roleInActivity}: ${p.name}${p.employeeId ? ` [${p.employeeId}]` : ''}${p.email ? ` (${p.email})` : ''}`)
                   .join(' | ')
                   .replace(/"/g, '""');
                 const notified = l.notifiedOnFinish.join(' | ').replace(/"/g, '""');
                 return [
-                  `"${formatDateTime(l.timestamp)}"`,
+                  `"${String(idx + 1).padStart(2, '0')}"`,
                   `"${l.stage}"`,
+                  `"${formatAuditTimestamp(l.timestamp)}"`,
+                  `"${(l.when || '').replace(/"/g, '""')}"`,
                   `"${l.resolvedEntityType}"`,
                   `"${l.entityId || ''}"`,
-                  `"${(l.entityTitle || '').replace(/"/g, '""')}"`,
-                  `"${l.action.replace(/"/g, '""')}"`,
-                  `"${(l.initiatedBy ? formatActorInline(l.initiatedBy) : formatActorInline(l.actor)).replace(/"/g, '""')}"`,
-                  `"${l.actor.name.replace(/"/g, '""')}"`,
-                  `"${(l.actor.employeeId || '').replace(/"/g, '""')}"`,
-                  `"${(l.actor.email || '').replace(/"/g, '""')}"`,
+                  `"${normalizeSyMetricText(l.entityTitle || '').replace(/"/g, '""')}"`,
+                  `"${normalizeSyMetricText(l.action).replace(/"/g, '""')}"`,
+                  `"${normalizeSyMetricText(l.why || '').replace(/"/g, '""')}"`,
+                  `"${normalizeSyMetricText(l.initiatedBy ? formatActorInline(l.initiatedBy) : formatActorInline(l.actor)).replace(/"/g, '""')}"`,
+                  `"${normalizeSyMetricText(l.actor.name).replace(/"/g, '""')}"`,
+                  `"${(l.actor.employeeId || '—').replace(/"/g, '""')}"`,
+                  `"${(l.actor.email || '—').replace(/"/g, '""')}"`,
                   `"${(l.actor.role || '').replace(/"/g, '""')}"`,
                   `"${involved}"`,
                   `"${notified}"`,
-                  `"${(l.nextAfterFinish || '').replace(/"/g, '""')}"`,
+                  `"${normalizeSyMetricText(l.nextAfterFinish || '').replace(/"/g, '""')}"`,
                   `"${(l.changes || []).map(c => `${c.field}: ${c.from ?? '-'} -> ${c.to ?? '-'}`).join('; ').replace(/"/g, '""')}"`,
                   `"${formatDetailEntries(l.details).map(d => `${d.label}: ${d.value}`).join(' | ').replace(/"/g, '""')}"`
                 ].join(',');
@@ -1851,23 +2119,32 @@ export default function Reports() {
                       <span>Report-Wise Audit Trail</span>
                     </h3>
                     <p className="text-xs text-muted-foreground mt-0.5">
-                      Inspect full end-to-end activity history showing who initiated, all involved people, who was notified on finish, and who gets it next.
+                      Inspect full end-to-end activity history showing steps, stages, timestamps, actions, performer employee IDs, and email IDs.
                     </p>
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <button
                       type="button"
                       onClick={loadReportAuditTrail}
                       disabled={auditLoading}
-                      className="px-3.5 py-2 border rounded-lg text-xs font-bold hover:bg-accent transition-colors flex items-center gap-1.5"
+                      className="px-3.5 py-2 border rounded-lg text-xs font-bold hover:bg-accent transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0"
                     >
                       <RefreshCw className={cn('w-3.5 h-3.5', auditLoading && 'animate-spin')} />
                       <span>Refresh</span>
                     </button>
                     <button
                       type="button"
+                      onClick={handleExportAuditPdf}
+                      disabled={exportingAuditPdf}
+                      className="px-3.5 py-2 bg-sky-600 text-white rounded-lg text-xs font-bold hover:bg-sky-700 disabled:opacity-60 transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                    >
+                      {exportingAuditPdf ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileText className="w-3.5 h-3.5" />}
+                      <span>Final Audit Report PDF</span>
+                    </button>
+                    <button
+                      type="button"
                       onClick={handleExportAuditCsv}
-                      className="px-3.5 py-2 bg-emerald-600 text-white rounded-lg text-xs font-bold hover:bg-emerald-700 transition-colors flex items-center gap-1.5"
+                      className="px-3.5 py-2 bg-emerald-600 text-white rounded-lg text-xs font-bold hover:bg-emerald-700 transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0"
                     >
                       <Download className="w-3.5 h-3.5" />
                       <span>Export CSV</span>
@@ -1886,27 +2163,59 @@ export default function Reports() {
                       }}
                       className="w-full px-3 py-2 bg-background border rounded-lg text-xs outline-none focus:ring-2 focus:ring-primary/20"
                     >
-                      <option value="all">All Categories</option>
-                      <option value="assessment_report">Evaluation Reports</option>
-                      <option value="training_register">Training Registers</option>
-                      <option value="template">Questionnaire Templates</option>
-                      <option value="assignment">Assignments</option>
+                      <option value="all">All Reports ({categoryCounts.all})</option>
+                      <option value="training_register">Training Registers ({categoryCounts.training_register})</option>
+                      <option value="assessment_report">Assessment / Evaluation Reports ({categoryCounts.assessment_report})</option>
+                      <option value="assignment">Assessments / Assignments ({categoryCounts.assignment})</option>
+                      <option value="template">Questionnaire Templates ({categoryCounts.template})</option>
+                      <option value="system">System / Auth &amp; Other Reports ({categoryCounts.system})</option>
                     </select>
                   </div>
 
                   <div className="space-y-1.5">
                     <label className="text-xs font-bold uppercase text-muted-foreground">Select Specific Report (Full Lifecycle)</label>
                     <select
-                      value={selectedAuditEntityId}
-                      onChange={(e) => setSelectedAuditEntityId(e.target.value)}
+                      value={
+                        selectedAuditEntityId === 'all' && auditCategoryFilter !== 'all'
+                          ? `__category:${auditCategoryFilter}`
+                          : selectedAuditEntityId
+                      }
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        if (val === 'all') {
+                          setAuditCategoryFilter('all');
+                          setSelectedAuditEntityId('all');
+                        } else if (val.startsWith('__category:')) {
+                          setAuditCategoryFilter(val.replace('__category:', ''));
+                          setSelectedAuditEntityId('all');
+                        } else {
+                          setSelectedAuditEntityId(val);
+                        }
+                      }}
                       className="w-full px-3 py-2 bg-background border rounded-lg text-xs outline-none focus:ring-2 focus:ring-primary/20"
                     >
-                      <option value="all">All Reports ({filteredEntities.length})</option>
-                      {filteredEntities.map((ent) => (
-                        <option key={ent.id} value={ent.id}>
-                          {ent.label}
-                        </option>
-                      ))}
+                      <option value="all">All Reports ({categoryCounts.all})</option>
+                      <optgroup label="Category-Wise Reports">
+                        <option value="__category:training_register">All Training Registers ({categoryCounts.training_register})</option>
+                        <option value="__category:assessment_report">All Assessment / Evaluation Reports ({categoryCounts.assessment_report})</option>
+                        <option value="__category:assignment">All Assessments / Assignments ({categoryCounts.assignment})</option>
+                        <option value="__category:template">All Questionnaire Templates ({categoryCounts.template})</option>
+                        <option value="__category:system">All System / Auth &amp; Other Reports ({categoryCounts.system})</option>
+                      </optgroup>
+                      {reportCategoryGroups.map((cat) => {
+                        if (auditCategoryFilter !== 'all' && auditCategoryFilter !== cat.key) return null;
+                        const groupItems = filteredEntities.filter((ent) => ent.type === cat.key);
+                        if (groupItems.length === 0) return null;
+                        return (
+                          <optgroup key={cat.key} label={`${cat.label} (${groupItems.length})`}>
+                            {groupItems.map((ent) => (
+                              <option key={ent.id} value={ent.id}>
+                                {ent.label}
+                              </option>
+                            ))}
+                          </optgroup>
+                        );
+                      })}
                     </select>
                   </div>
 
@@ -1931,8 +2240,10 @@ export default function Reports() {
                   summary={selectedLifecycleSummary}
                   title={
                     selectedLifecycleSummary.entityType === 'training_register'
-                      ? 'Training Register Full Lifecycle (Initiation to Closure)'
-                      : 'Evaluation Report Full Lifecycle (Initiation to Closure)'
+                      ? 'Training Register — Final Audit Report (Changes & Activities)'
+                      : selectedLifecycleSummary.entityType === 'template'
+                      ? 'Questionnaire Template — Final Audit Report (Changes & Activities)'
+                      : 'Report-Wise Final Audit Report (Changes & Activities)'
                   }
                 />
               )}
@@ -1956,15 +2267,16 @@ export default function Reports() {
                     <table className="w-full text-left text-xs">
                       <thead className="bg-muted/50 border-b text-muted-foreground uppercase font-bold">
                         <tr>
-                          <th className="px-4 py-3">Timestamp</th>
-                          <th className="px-4 py-3">Stage, Report &amp; Action</th>
-                          <th className="px-4 py-3">Initiator &amp; Actor</th>
+                          <th className="px-4 py-3 whitespace-nowrap">Step</th>
+                          <th className="px-4 py-3 whitespace-nowrap">Stage &amp; Timestamp</th>
+                          <th className="px-4 py-3">Action &amp; Why Performed</th>
+                          <th className="px-4 py-3 whitespace-nowrap">Performed By (Emp ID &amp; Email ID)</th>
                           <th className="px-4 py-3">Involved, Notified &amp; Next Handoff</th>
                           <th className="px-4 py-3">Changes &amp; Full Activity Details</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y">
-                        {filteredAuditLogs.map((log) => {
+                        {filteredAuditLogs.map((log, logIdx) => {
                           const detailPairs = formatDetailEntries(log.details);
                           const targetEntityId =
                             log.details?.submissionId ||
@@ -1976,22 +2288,31 @@ export default function Reports() {
 
                           return (
                             <tr key={log.id} className="hover:bg-muted/20 transition-colors align-top">
-                              <td className="px-4 py-3 whitespace-nowrap font-mono text-muted-foreground">
-                                {formatDateTime(log.timestamp)}
+                              <td className="px-4 py-3 font-mono tabular-nums font-semibold text-foreground whitespace-nowrap">
+                                {String(logIdx + 1).padStart(2, '0')}
+                              </td>
+                              <td className="px-4 py-3 whitespace-nowrap">
+                                <p className="font-semibold text-foreground">{log.stage}</p>
+                                <p className="font-mono tabular-nums text-[11px] text-muted-foreground mt-0.5">{formatAuditTimestamp(log.timestamp)}</p>
+                                {log.when && (
+                                  <p className="text-[10px] text-foreground/80 font-medium whitespace-normal max-w-[160px] mt-1">
+                                    When: {log.when}
+                                  </p>
+                                )}
                               </td>
                               <td className="px-4 py-3">
-                                <div className="space-y-1 min-w-[165px]">
-                                  <div className="flex flex-wrap items-center gap-1">
-                                    <span className="px-1.5 py-0.5 rounded bg-slate-100 text-slate-800 text-[10px] font-bold uppercase">
-                                      {log.stage}
-                                    </span>
-                                    <span className="px-1.5 py-0.5 rounded bg-primary/10 text-primary text-[10px] font-bold uppercase">
-                                      {log.resolvedEntityType.replace(/_/g, ' ')}
-                                    </span>
-                                  </div>
-                                  <p className="font-bold text-foreground">{log.action}</p>
-                                  {log.entityTitle && <p className="font-semibold text-foreground">{log.entityTitle}</p>}
-                                  {log.entityId && <p className="text-[10px] font-mono text-muted-foreground">ID: {log.entityId}</p>}
+                                <div className="space-y-1 min-w-[200px] max-w-xs">
+                                  <p className="text-[10px] font-bold uppercase text-primary">
+                                    {log.resolvedEntityType.replace(/_/g, ' ')}
+                                  </p>
+                                  <p className="font-bold text-foreground">{normalizeSyMetricText(log.action)}</p>
+                                  {log.why && (
+                                    <p className="text-[11px] text-muted-foreground leading-snug bg-muted/40 px-2 py-1 rounded border">
+                                      <span className="font-bold text-foreground">Why: </span>{normalizeSyMetricText(log.why)}
+                                    </p>
+                                  )}
+                                  {log.entityTitle && <p className="font-semibold text-foreground">{normalizeSyMetricText(log.entityTitle)}</p>}
+                                  {log.entityId && <p className="text-[10px] font-mono tabular-nums text-muted-foreground">ID: {log.entityId}</p>}
                                   <div className="flex flex-wrap items-center gap-2 pt-0.5">
                                     <button
                                       type="button"
@@ -2008,33 +2329,30 @@ export default function Reports() {
                                         className="text-[10px] font-bold text-blue-700 hover:underline inline-flex items-center gap-1"
                                       >
                                         <History className="w-3 h-3" />
-                                        <span>Full Lifecycle</span>
+                                        <span>Final Audit Report</span>
                                       </button>
                                     )}
                                   </div>
                                 </div>
                               </td>
                               <td className="px-4 py-3">
-                                <div className="space-y-1 min-w-[165px]">
+                                <div className="space-y-1 min-w-[185px]">
                                   <div>
-                                    <p className="text-[10px] font-bold uppercase text-muted-foreground">Performed By</p>
-                                    <p className="font-bold text-foreground">{log.actor.name}</p>
-                                    {log.actor.employeeId && (
-                                      <span className="inline-block px-1.5 py-0.5 rounded bg-muted font-mono text-[10px] font-semibold text-primary">
-                                        ID: {log.actor.employeeId}
-                                      </span>
-                                    )}
-                                    {log.actor.email && (
-                                      <p className="text-[11px] font-mono text-muted-foreground">{log.actor.email}</p>
-                                    )}
+                                    <p className="font-bold text-foreground">{normalizeSyMetricText(log.actor.name)}</p>
+                                    <p className="text-[11px] text-muted-foreground">
+                                      Employee ID: <span className="font-mono tabular-nums font-semibold text-foreground">{log.actor.employeeId || '—'}</span>
+                                    </p>
+                                    <p className="text-[11px] text-muted-foreground">
+                                      Email ID: <span className="font-mono text-foreground">{log.actor.email || '—'}</span>
+                                    </p>
                                     {log.actor.role && (
-                                      <p className="text-[10px] text-primary font-semibold">{log.actor.role}</p>
+                                      <p className="text-[10px] text-primary font-semibold mt-0.5">{log.actor.role}</p>
                                     )}
                                   </div>
                                   {log.initiatedBy && log.initiatedBy.name !== log.actor.name && (
                                     <div className="pt-1 border-t border-dashed">
                                       <p className="text-[10px] font-bold uppercase text-blue-700">Initiated By</p>
-                                      <p className="text-[11px] font-semibold text-foreground">{formatActorInline(log.initiatedBy)}</p>
+                                      <p className="text-[11px] font-semibold text-foreground">{normalizeSyMetricText(formatActorInline(log.initiatedBy))}</p>
                                     </div>
                                   )}
                                 </div>
@@ -2176,7 +2494,7 @@ export default function Reports() {
                           {row.map((cell: any, j: number) => (
                             <td key={j} className="px-4 py-3">
                               {typeof cell === 'object' && cell?.type === 'action' ? (
-                                <div className="flex items-center gap-2">
+                                <div className="flex items-center gap-1.5">
                                   <button
                                     onClick={() => viewIndividualReport(cell.submissionId)}
                                     disabled={cell.disabled}
@@ -2192,6 +2510,19 @@ export default function Reports() {
                                     title="Download Individual Report"
                                   >
                                     <Download className="w-4 h-4" />
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      openRowAuditReport({
+                                        submissionId: cell.submissionId,
+                                        assignmentId: cell.assignmentId
+                                      })
+                                    }
+                                    className="p-2 hover:bg-sky-50 rounded-lg text-sky-700 transition-colors"
+                                    title="View Final Audit Report (Changes & Activities)"
+                                  >
+                                    <History className="w-4 h-4" />
                                   </button>
                                 </div>
                               ) : cell}
@@ -2281,7 +2612,7 @@ export default function Reports() {
                     <span className="text-muted-foreground">SOP Name:</span>
                     <span className="font-medium">{selectedIndividualReport.template?.name}</span>
                     <span className="text-muted-foreground">SOP Version:</span>
-                    <span className="font-mono font-bold text-primary">{selectedIndividualReport.template?.version || 'V1.0'}</span>
+                    <span className="font-mono font-bold text-primary">{formatQuestionnaireVersion(selectedIndividualReport.template?.version) || '—'}</span>
                     <span className="text-muted-foreground">Trainer Name:</span>
                     <span className="font-medium">
                       {selectedIndividualReport.reviewer?.displayName === 'System Admin' 
@@ -2393,16 +2724,6 @@ export default function Reports() {
                     <p className="text-xs font-bold uppercase text-muted-foreground mb-1">Overall Comments</p>
                     <p className="text-sm">{selectedIndividualReport.evaluation.overallComments || 'No overall comments provided.'}</p>
                   </div>
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div>
-                      <p className="text-xs font-bold uppercase text-emerald-600 mb-1">Strengths</p>
-                      <p className="text-sm">{selectedIndividualReport.evaluation.strengths || 'N/A'}</p>
-                    </div>
-                    <div>
-                      <p className="text-xs font-bold uppercase text-amber-600 mb-1">Areas for Improvement</p>
-                      <p className="text-sm">{selectedIndividualReport.evaluation.improvements || 'N/A'}</p>
-                    </div>
-                  </div>
                   <div className="pt-4 border-t flex justify-between items-center">
                     <div className="flex items-center gap-2">
                       <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center text-primary font-bold text-xs">
@@ -2438,19 +2759,41 @@ export default function Reports() {
               )}
             </div>
 
-            <div className="p-6 border-t bg-muted/10 flex justify-end gap-3">
+            <div className="p-6 border-t bg-muted/10 flex flex-wrap justify-end gap-3">
               <button 
                 onClick={() => setSelectedIndividualReport(null)}
-                className="px-6 py-2 border rounded-lg font-bold hover:bg-accent transition-colors"
+                className="px-6 py-2 border rounded-lg font-bold hover:bg-accent transition-colors whitespace-nowrap shrink-0"
               >
                 Close
               </button>
+              {individualLifecycleSummary && (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    setExportingAuditPdf(true);
+                    try {
+                      await generateFinalAuditReportPdf(individualLifecycleSummary, branding);
+                      toast.success('Final Audit Report PDF downloaded');
+                    } catch (err) {
+                      console.error('Failed to generate Final Audit Report PDF:', err);
+                      toast.error('Failed to generate Final Audit Report PDF.');
+                    } finally {
+                      setExportingAuditPdf(false);
+                    }
+                  }}
+                  disabled={exportingAuditPdf}
+                  className="px-5 py-2 bg-sky-600 text-white rounded-lg font-bold hover:bg-sky-700 disabled:opacity-60 transition-all flex items-center gap-2 whitespace-nowrap shrink-0"
+                >
+                  {exportingAuditPdf ? <Loader2 className="w-4 h-4 animate-spin" /> : <History className="w-4 h-4" />}
+                  <span>Final Audit Report PDF</span>
+                </button>
+              )}
               <button 
                 onClick={() => {
                   const subId = selectedIndividualReport.submission.id;
                   downloadIndividualReport(subId);
                 }}
-                className="px-6 py-2 bg-primary text-primary-foreground rounded-lg font-bold hover:opacity-90 transition-all flex items-center gap-2"
+                className="px-6 py-2 bg-primary text-primary-foreground rounded-lg font-bold hover:opacity-90 transition-all flex items-center gap-2 whitespace-nowrap shrink-0"
               >
                 <Download className="w-4 h-4" />
                 Download PDF
@@ -2519,11 +2862,54 @@ export default function Reports() {
         </div>
       )}
 
-      {exporting && (
+      {auditModalSummary && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-xs p-4">
+          <div className="bg-card w-full max-w-5xl max-h-[90vh] rounded-2xl border shadow-2xl flex flex-col overflow-hidden">
+            <div className="p-5 border-b flex items-center justify-between bg-muted/20">
+              <div className="flex items-center gap-3">
+                <BrandLogo area="reports" size="md" />
+                <div>
+                  <h3 className="text-lg font-bold text-foreground">
+                    Report-Wise Final Audit Report
+                  </h3>
+                  <p className="text-xs text-muted-foreground">
+                    {normalizeSyMetricText(auditModalSummary.entityTitle)}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAuditModalSummary(null)}
+                className="p-2 hover:bg-accent rounded-full transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-5 overflow-y-auto flex-1">
+              <AuditLifecyclePanel
+                summary={auditModalSummary}
+                compact
+                title="Report-Wise Final Audit Report (Changes & Activities)"
+              />
+            </div>
+            <div className="p-4 border-t bg-muted/10 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setAuditModalSummary(null)}
+                className="px-5 py-2 border rounded-xl text-xs font-bold hover:bg-accent"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {(exporting || auditModalLoading) && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/20 backdrop-blur-[2px]">
           <div className="bg-card p-6 rounded-2xl border shadow-2xl flex flex-col items-center gap-4">
             <Loader2 className="w-10 h-10 text-primary animate-spin" />
-            <p className="font-bold text-lg">Generating Report...</p>
+            <p className="font-bold text-lg">{auditModalLoading ? 'Loading Audit Report...' : 'Generating Report...'}</p>
             <p className="text-sm text-muted-foreground">This may take a few moments depending on data size.</p>
           </div>
         </div>

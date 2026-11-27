@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Search, History, User, Shield, Clock, Download, Calendar, X, BellRing, ArrowRightCircle, Users } from 'lucide-react';
+import { Search, History, User, Shield, Clock, Download, Calendar, X, BellRing, ArrowRightCircle, Users, FileText, Loader2 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 import { firestoreService } from '../services/firestoreService';
 import { trainingRegisterService } from '../services/trainingRegisterService';
@@ -14,7 +14,7 @@ import {
   TrainingRegisterTemplateConfig,
   User as UserType
 } from '../types';
-import { formatDateTime, cn } from '../lib/utils';
+import { formatAuditTimestamp, normalizeSyMetricText, cn } from '../lib/utils';
 import { toast } from 'sonner';
 import { AuditLifecyclePanel, SingleActivityDetailCard } from '../components/AuditLifecyclePanel';
 import {
@@ -26,9 +26,10 @@ import {
   formatDetailEntries,
   LifecycleReportSummary
 } from '../utils/auditLifecycle';
+import { generateAuditLogsListPdf } from '../utils/finalAuditReportPdf';
 
 export default function AuditLogs() {
-  const { user: currentUser } = useAuth();
+  const { user: currentUser, branding } = useAuth();
   const [logs, setLogs] = useState<EnrichedAuditLog[]>([]);
   const [rawLogs, setRawLogs] = useState<AuditLog[]>([]);
   const [allUsers, setAllUsers] = useState<UserType[]>([]);
@@ -42,6 +43,7 @@ export default function AuditLogs() {
   const [selectedActivityLog, setSelectedActivityLog] = useState<EnrichedAuditLog | null>(null);
   const [selectedLifecycle, setSelectedLifecycle] = useState<LifecycleReportSummary | null>(null);
   const [loading, setLoading] = useState(true);
+  const [exportingPdf, setExportingPdf] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [entityFilter, setEntityFilter] = useState<string>('all');
   const [dateFilter, setDateFilter] = useState({
@@ -156,7 +158,7 @@ export default function AuditLogs() {
       const involvedText = log.involvedParties
         .map(p => `${p.roleInActivity} ${p.name} ${p.email || ''} ${p.employeeId || ''}`)
         .join(' ');
-      const searchStr = `${log.stage} ${log.action} ${log.module} ${resolvedType} ${log.entityId || ''} ${log.entityTitle || ''} ${log.actor.name} ${log.actor.email} ${log.actor.employeeId || ''} ${log.actor.role || ''} ${involvedText} ${log.notifiedOnFinish.join(' ')} ${log.nextAfterFinish} ${JSON.stringify(log.details || {})} ${JSON.stringify(log.changes || [])}`.toLowerCase();
+      const searchStr = `${log.stage} ${log.when} ${log.why} ${log.action} ${log.module} ${resolvedType} ${log.entityId || ''} ${log.entityTitle || ''} ${log.actor.name} ${log.actor.email} ${log.actor.employeeId || ''} ${log.actor.role || ''} ${involvedText} ${log.notifiedOnFinish.join(' ')} ${log.nextAfterFinish} ${JSON.stringify(log.details || {})} ${JSON.stringify(log.changes || [])}`.toLowerCase();
       if (!searchStr.includes(searchQuery.trim().toLowerCase())) {
         return false;
       }
@@ -184,6 +186,31 @@ export default function AuditLogs() {
     setDateFilter({ start: '', end: '' });
   };
 
+  const handleDownloadPdf = async () => {
+    if (filteredLogs.length === 0) {
+      toast.error('No audit logs to export');
+      return;
+    }
+    setExportingPdf(true);
+    try {
+      await generateAuditLogsListPdf(
+        filteredLogs,
+        'System Audit Logs — Final Audit Report',
+        branding,
+        {
+          filenamePrefix: 'system_audit_final_report',
+          status: `${filteredLogs.length} Audited Event${filteredLogs.length === 1 ? '' : 's'}`
+        }
+      );
+      toast.success('Final Audit Report PDF downloaded');
+    } catch (error) {
+      console.error('Error generating Audit Report PDF:', error);
+      toast.error('Failed to generate Final Audit Report PDF');
+    } finally {
+      setExportingPdf(false);
+    }
+  };
+
   const handleDownloadCSV = () => {
     if (filteredLogs.length === 0) {
       toast.error('No logs to download');
@@ -191,14 +218,17 @@ export default function AuditLogs() {
     }
 
     const headers = [
+      'Step',
+      'Stage',
       'Timestamp',
-      'Lifecycle Stage',
+      'When (Timing / Context)',
       'Initiated By',
-      'Performed By Name',
+      'Performed By (Name)',
       'Performed By Employee ID',
-      'Performed By Email',
+      'Performed By Email ID',
       'Performed By Role',
       'Action',
+      'Why Action Was Performed',
       'Module',
       'Entity Type',
       'Entity / Report ID',
@@ -211,7 +241,7 @@ export default function AuditLogs() {
     ];
     const csvContent = [
       headers.join(','),
-      ...filteredLogs.map(log => {
+      ...filteredLogs.map((log, index) => {
         const details = formatDetailEntries(log.details).map(d => `${d.label}: ${d.value}`).join(' | ').replace(/"/g, '""');
         const changes = (log.changes || []).map(c => `${c.field}: ${c.from ?? '-'} -> ${c.to ?? '-'}`).join('; ').replace(/"/g, '""');
         const involved = log.involvedParties
@@ -220,21 +250,24 @@ export default function AuditLogs() {
           .replace(/"/g, '""');
         const notified = log.notifiedOnFinish.join(' | ').replace(/"/g, '""');
         return [
-          `"${formatDateTime(log.timestamp)}"`,
+          `"${String(index + 1).padStart(2, '0')}"`,
           `"${log.stage}"`,
-          `"${(log.initiatedBy ? formatActorInline(log.initiatedBy) : formatActorInline(log.actor)).replace(/"/g, '""')}"`,
-          `"${log.actor.name.replace(/"/g, '""')}"`,
-          `"${(log.actor.employeeId || '').replace(/"/g, '""')}"`,
-          `"${(log.actor.email || '').replace(/"/g, '""')}"`,
+          `"${formatAuditTimestamp(log.timestamp)}"`,
+          `"${(log.when || '').replace(/"/g, '""')}"`,
+          `"${normalizeSyMetricText(log.initiatedBy ? formatActorInline(log.initiatedBy) : formatActorInline(log.actor)).replace(/"/g, '""')}"`,
+          `"${normalizeSyMetricText(log.actor.name).replace(/"/g, '""')}"`,
+          `"${(log.actor.employeeId || '—').replace(/"/g, '""')}"`,
+          `"${(log.actor.email || '—').replace(/"/g, '""')}"`,
           `"${(log.actor.role || '').replace(/"/g, '""')}"`,
-          `"${log.action.replace(/"/g, '""')}"`,
+          `"${normalizeSyMetricText(log.action).replace(/"/g, '""')}"`,
+          `"${normalizeSyMetricText(log.why || '').replace(/"/g, '""')}"`,
           `"${log.module}"`,
           `"${log.resolvedEntityType}"`,
           `"${log.entityId || ''}"`,
-          `"${(log.entityTitle || '').replace(/"/g, '""')}"`,
+          `"${normalizeSyMetricText(log.entityTitle || '').replace(/"/g, '""')}"`,
           `"${involved}"`,
           `"${notified}"`,
-          `"${(log.nextAfterFinish || '').replace(/"/g, '""')}"`,
+          `"${normalizeSyMetricText(log.nextAfterFinish || '').replace(/"/g, '""')}"`,
           `"${changes}"`,
           `"${details}"`
         ].join(',');
@@ -355,17 +388,26 @@ export default function AuditLogs() {
             )}
             <button 
               onClick={handleSearch}
-              className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg font-medium hover:opacity-90 transition-opacity whitespace-nowrap text-xs"
+              className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg font-medium hover:opacity-90 transition-opacity whitespace-nowrap shrink-0 text-xs"
             >
               <Search className="w-3.5 h-3.5" />
               <span>Search</span>
             </button>
+            <button
+              type="button"
+              onClick={handleDownloadPdf}
+              disabled={exportingPdf}
+              className="flex items-center gap-1.5 px-3.5 py-2 bg-sky-600 text-white rounded-lg font-semibold hover:bg-sky-700 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0 text-xs"
+            >
+              {exportingPdf ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileText className="w-3.5 h-3.5" />}
+              <span>Final Audit Report PDF</span>
+            </button>
             <button 
               onClick={handleDownloadCSV}
-              className="flex items-center gap-2 px-4 py-2 bg-emerald-600 text-white rounded-lg font-medium hover:bg-emerald-700 transition-colors whitespace-nowrap text-xs"
+              className="flex items-center gap-1.5 px-3.5 py-2 bg-emerald-600 text-white rounded-lg font-medium hover:bg-emerald-700 transition-colors whitespace-nowrap shrink-0 text-xs"
             >
               <Download className="w-3.5 h-3.5" />
-              <span>Download</span>
+              <span>CSV</span>
             </button>
           </div>
         </div>
@@ -374,10 +416,10 @@ export default function AuditLogs() {
           <table className="w-full text-left">
             <thead>
               <tr className="bg-muted/50 text-muted-foreground text-xs uppercase tracking-wider">
-                <th className="px-4 py-4 font-semibold">S.No</th>
-                <th className="px-4 py-4 font-semibold">Timestamp</th>
-                <th className="px-4 py-4 font-semibold">Initiator &amp; Actor</th>
-                <th className="px-4 py-4 font-semibold">Stage &amp; Action</th>
+                <th className="px-4 py-4 font-semibold whitespace-nowrap">Step</th>
+                <th className="px-4 py-4 font-semibold whitespace-nowrap">Stage &amp; Timestamp</th>
+                <th className="px-4 py-4 font-semibold whitespace-nowrap">Performed By (Emp ID &amp; Email ID)</th>
+                <th className="px-4 py-4 font-semibold">Action &amp; Why</th>
                 <th className="px-4 py-4 font-semibold">Involved, Notified &amp; Next Handoff</th>
                 <th className="px-4 py-4 font-semibold">Changes &amp; Details</th>
               </tr>
@@ -387,33 +429,36 @@ export default function AuditLogs() {
                 const detailPairs = formatDetailEntries(log.details);
                 return (
                 <tr key={log.id} className="hover:bg-accent/50 transition-colors align-top">
-                  <td className="px-4 py-4 text-sm font-medium">
-                    {index + 1}
+                  <td className="px-4 py-4 text-sm font-mono tabular-nums font-semibold">
+                    {String(index + 1).padStart(2, '0')}
                   </td>
-                  <td className="px-4 py-4 text-xs text-muted-foreground whitespace-nowrap font-mono">
-                    {formatDateTime(log.timestamp)}
+                  <td className="px-4 py-4 text-xs text-muted-foreground whitespace-nowrap">
+                    <p className="font-semibold text-foreground">{log.stage}</p>
+                    <p className="font-mono tabular-nums text-[11px] mt-0.5">{formatAuditTimestamp(log.timestamp)}</p>
+                    {log.when && (
+                      <p className="text-[10px] text-foreground/80 font-medium whitespace-normal max-w-[170px] mt-1">
+                        When: {log.when}
+                      </p>
+                    )}
                   </td>
                   <td className="px-4 py-4 text-xs">
-                    <div className="space-y-1 min-w-[170px]">
+                    <div className="space-y-1 min-w-[190px]">
                       <div>
-                        <p className="text-[10px] font-bold uppercase text-muted-foreground">Performed By</p>
-                        <p className="font-bold text-foreground">{log.actor.name}</p>
-                        {log.actor.employeeId && (
-                          <span className="inline-block px-1.5 py-0.5 rounded bg-muted font-mono text-[10px] font-semibold text-primary">
-                            ID: {log.actor.employeeId}
-                          </span>
-                        )}
-                        {log.actor.email && (
-                          <p className="text-[11px] font-mono text-muted-foreground">{log.actor.email}</p>
-                        )}
+                        <p className="font-bold text-foreground">{normalizeSyMetricText(log.actor.name)}</p>
+                        <p className="text-[11px] text-muted-foreground">
+                          Employee ID: <span className="font-mono tabular-nums font-semibold text-foreground">{log.actor.employeeId || '—'}</span>
+                        </p>
+                        <p className="text-[11px] text-muted-foreground">
+                          Email ID: <span className="font-mono text-foreground">{log.actor.email || '—'}</span>
+                        </p>
                         {log.actor.role && (
-                          <p className="text-[10px] text-primary font-semibold">{log.actor.role}</p>
+                          <p className="text-[10px] text-primary font-semibold mt-0.5">{log.actor.role}</p>
                         )}
                       </div>
                       {log.initiatedBy && log.initiatedBy.name !== log.actor.name && (
                         <div className="pt-1 border-t border-dashed">
                           <p className="text-[10px] font-bold uppercase text-blue-700">Initiated By</p>
-                          <p className="text-[11px] font-semibold text-foreground">{formatActorInline(log.initiatedBy)}</p>
+                          <p className="text-[11px] font-semibold text-foreground">{normalizeSyMetricText(formatActorInline(log.initiatedBy))}</p>
                         </div>
                       )}
                     </div>
@@ -436,6 +481,11 @@ export default function AuditLogs() {
                       )}>
                         {log.action}
                       </span>
+                      {log.why && (
+                        <p className="text-[11px] text-muted-foreground leading-snug bg-muted/40 px-2 py-1 rounded border">
+                          <span className="font-bold text-foreground">Why: </span>{log.why}
+                        </p>
+                      )}
                       {log.entityTitle && <p className="text-xs font-semibold text-foreground">{log.entityTitle}</p>}
                       {log.entityId && <p className="text-[10px] font-mono text-muted-foreground">ID: {log.entityId}</p>}
                       <button

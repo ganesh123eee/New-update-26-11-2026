@@ -30,6 +30,7 @@ export function sanitizeReportBrandName(name?: string): string {
   if (!name) return '';
   return name
     .replace(/\b(symetric\s*)?assess(ment)?\s*pro\b/gi, '')
+    .replace(/symetric/gi, 'SyMetric')
     .replace(/^[\s\-|•:]+|[\s\-|•:]+$/g, '')
     .replace(/\s{2,}/g, ' ')
     .trim();

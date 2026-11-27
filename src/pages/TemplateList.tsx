@@ -5,7 +5,7 @@ import { firestoreService } from '../services/firestoreService';
 import { where } from 'firebase/firestore';
 import { toast } from 'sonner';
 import { Template, Department, TrainingRegisterTemplateConfig } from '../types';
-import { formatDate, cn } from '../lib/utils';
+import { formatDate, cn, formatQuestionnaireVersion } from '../lib/utils';
 import { useAuth } from '../contexts/AuthContext';
 import { trainingRegisterService, DEFAULT_TEMPLATE_CONFIG } from '../services/trainingRegisterService';
 import { TrainingRegisterTemplateEditorModal } from '../components/TrainingRegisterTemplateEditorModal';
@@ -89,12 +89,17 @@ export default function TemplateList() {
         { 
           templateId: id, 
           templateName: template?.name,
-          version: template?.version || 'V1.0',
+          version: formatQuestionnaireVersion(template?.version) || undefined,
           deletedAssignmentsCount: assignments.length
         },
         user?.uid,
         user?.email,
-        { entityType: 'template', entityId: id, entityTitle: template?.name }
+        {
+          entityType: 'template',
+          entityId: id,
+          entityTitle: template?.name,
+          why: 'To remove an obsolete questionnaire template and its linked assignments.'
+        }
       );
       setDeleteConfirmId(null);
       toast.success(`Template and ${assignments.length} related assignments deleted successfully`);
@@ -336,9 +341,11 @@ export default function TemplateList() {
                   )}>
                     {template.status}
                   </div>
-                  <span className="px-2 py-1 rounded bg-primary/10 text-primary text-[10px] font-mono font-bold">
-                    {template.version || 'V1.0'}
-                  </span>
+                  {formatQuestionnaireVersion(template.version) && (
+                    <span className="px-2 py-1 rounded bg-primary/10 text-primary text-[10px] font-mono font-bold">
+                      {formatQuestionnaireVersion(template.version)}
+                    </span>
+                  )}
                 </div>
                 <div className="flex gap-1">
                   <button 
@@ -437,9 +444,11 @@ export default function TemplateList() {
               <div>
                 <div className="flex items-center gap-2">
                   <h2 className="text-xl font-bold">{previewTemplate.name}</h2>
-                  <span className="px-2 py-0.5 rounded bg-primary/10 text-primary text-xs font-mono font-bold">
-                    {previewTemplate.version || 'V1.0'}
-                  </span>
+                  {formatQuestionnaireVersion(previewTemplate.version) && (
+                    <span className="px-2 py-0.5 rounded bg-primary/10 text-primary text-xs font-mono font-bold">
+                      {formatQuestionnaireVersion(previewTemplate.version)}
+                    </span>
+                  )}
                 </div>
                 <p className="text-sm text-muted-foreground">
                   {previewTemplate.skillCategory} • {previewTemplate.difficulty} • {previewTemplate.duration} mins

@@ -23,7 +23,7 @@ import {
 } from 'lucide-react';
 import { firestoreService } from '../services/firestoreService';
 import { Template, Question, Department, TemplateVersionEntry } from '../types';
-import { cn, formatDate } from '../lib/utils';
+import { cn, formatDate, formatQuestionnaireVersion } from '../lib/utils';
 import { useAuth } from '../contexts/AuthContext';
 
 export default function TemplateEditor() {
@@ -51,15 +51,16 @@ export default function TemplateEditor() {
     instructions: '',
     questions: [],
     status: 'draft',
-    version: 'V1.0',
+    version: '',
     effectiveDate: formatDate(new Date()),
-    versionNotes: 'Initial version',
+    versionNotes: '',
     documentCode: '',
     versionHistory: []
   });
 
   const bumpVersionString = (current?: string): string => {
-    const raw = (current || 'V1.0').trim();
+    const raw = formatQuestionnaireVersion(current);
+    if (!raw) return 'V1.1';
     const match = raw.match(/^(V?)(\d+)\.(\d+)$/i);
     if (match) {
       const prefix = match[1] ? 'V' : 'V';
@@ -82,7 +83,7 @@ export default function TemplateEditor() {
         if (data) {
           const normalized: Partial<Template> = {
             ...data,
-            version: data.version || 'V1.0',
+            version: formatQuestionnaireVersion(data.version),
             effectiveDate: data.effectiveDate || formatDate(data.updatedAt || data.createdAt || new Date()),
             versionNotes: data.versionNotes || '',
             documentCode: data.documentCode || '',
@@ -161,7 +162,7 @@ export default function TemplateEditor() {
       const { id: _, ...rest } = template;
       const nowIso = new Date().toISOString();
       const effectiveDate = (template.effectiveDate || formatDate(new Date())).trim();
-      let finalVersion = (template.version || 'V1.0').trim();
+      let finalVersion = formatQuestionnaireVersion(template.version);
       const existingHistory: TemplateVersionEntry[] = Array.isArray(template.versionHistory)
         ? [...template.versionHistory]
         : [];
@@ -177,12 +178,13 @@ export default function TemplateEditor() {
         )
       );
 
-      if (id && initialTemplate && contentChanged && finalVersion === (initialTemplate.version || 'V1.0')) {
+      const initialVer = formatQuestionnaireVersion(initialTemplate?.version);
+      if (id && initialTemplate && contentChanged && finalVersion === initialVer) {
         finalVersion = bumpVersionString(finalVersion);
       }
 
       const lastRecordedVersion = existingHistory[0]?.version;
-      if (existingHistory.length === 0 || lastRecordedVersion !== finalVersion || (id && contentChanged)) {
+      if (finalVersion && (existingHistory.length === 0 || lastRecordedVersion !== finalVersion || (id && contentChanged))) {
         existingHistory.unshift({
           version: finalVersion,
           updatedAt: nowIso,
@@ -211,8 +213,8 @@ export default function TemplateEditor() {
 
         const changes: Array<{ field: string; from?: any; to?: any }> = [];
         if (initialTemplate) {
-          if ((initialTemplate.version || 'V1.0') !== finalVersion) {
-            changes.push({ field: 'version', from: initialTemplate.version || 'V1.0', to: finalVersion });
+          if (initialVer !== finalVersion) {
+            changes.push({ field: 'version', from: initialVer || '-', to: finalVersion || '-' });
           }
           if (initialTemplate.status !== data.status) {
             changes.push({ field: 'status', from: initialTemplate.status, to: data.status });
@@ -241,9 +243,15 @@ export default function TemplateEditor() {
           { templateId: id, templateName: data.name, version: finalVersion, effectiveDate },
           user?.uid,
           user?.email,
-          { entityType: 'template', entityId: id, entityTitle: `${data.name} (${finalVersion})`, changes }
+          {
+            entityType: 'template',
+            entityId: id,
+            entityTitle: finalVersion ? `${data.name} (${finalVersion})` : data.name,
+            changes,
+            why: 'To update questionnaire content, rules, or revision metadata while maintaining version control.'
+          }
         );
-        toast.success(`Template updated (${finalVersion})`);
+        toast.success(finalVersion ? `Template updated (${finalVersion})` : 'Template updated');
       } else {
         // Force 100/80 on new templates just in case
         data.totalMarks = 100;
@@ -258,11 +266,12 @@ export default function TemplateEditor() {
           {
             entityType: 'template',
             entityId: newId,
-            entityTitle: `${data.name} (${finalVersion})`,
-            changes: [{ field: 'version', from: '-', to: finalVersion }]
+            entityTitle: finalVersion ? `${data.name} (${finalVersion})` : data.name,
+            changes: finalVersion ? [{ field: 'version', from: '-', to: finalVersion }] : [],
+            why: 'To create a new standardized assessment questionnaire template.'
           }
         );
-        toast.success(`Template created (${finalVersion})`);
+        toast.success(finalVersion ? `Template created (${finalVersion})` : 'Template created');
       }
       navigate('/templates');
     } catch (error) {
@@ -348,9 +357,11 @@ export default function TemplateEditor() {
           <div>
             <div className="flex items-center gap-2">
               <h1 className="text-2xl font-bold">{id ? 'Edit Template' : 'New Assessment Template'}</h1>
-              <span className="px-2.5 py-0.5 rounded-full text-xs font-mono font-bold bg-primary/10 text-primary">
-                {template.version || 'V1.0'}
-              </span>
+              {formatQuestionnaireVersion(template.version) && (
+                <span className="px-2.5 py-0.5 rounded-full text-xs font-mono font-bold bg-primary/10 text-primary">
+                  {formatQuestionnaireVersion(template.version)}
+                </span>
+              )}
             </div>
             <p className="text-sm text-muted-foreground">Configure your assessment structure, versioning details, and questions.</p>
           </div>
@@ -522,9 +533,9 @@ export default function TemplateEditor() {
                 <label className="text-xs font-bold uppercase text-muted-foreground">Version</label>
                 <input
                   type="text"
-                  value={template.version || 'V1.0'}
+                  value={formatQuestionnaireVersion(template.version)}
                   onChange={e => setTemplate({ ...template, version: e.target.value })}
-                  placeholder="V1.0"
+                  placeholder="Optional (e.g. V1.1)"
                   className="w-full px-3 py-2 bg-background border rounded-lg font-mono text-sm outline-none focus:ring-2 focus:ring-primary/20"
                 />
               </div>
@@ -795,9 +806,11 @@ export default function TemplateEditor() {
               <div>
                 <div className="flex items-center gap-2">
                   <h2 className="text-xl font-bold">{template.name || 'Untitled Template'}</h2>
-                  <span className="px-2 py-0.5 rounded bg-primary/10 text-primary text-xs font-mono font-bold">
-                    {template.version || 'V1.0'}
-                  </span>
+                  {formatQuestionnaireVersion(template.version) && (
+                    <span className="px-2 py-0.5 rounded bg-primary/10 text-primary text-xs font-mono font-bold">
+                      {formatQuestionnaireVersion(template.version)}
+                    </span>
+                  )}
                 </div>
                 <p className="text-sm text-muted-foreground">
                   {template.skillCategory || 'No Category'} • {template.difficulty} • {template.duration} mins
